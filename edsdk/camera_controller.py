@@ -1062,7 +1062,10 @@ class CameraController:
             keep_files=keep_files,
             raw_processor=raw_processor,
         )
-        return [np.array(im) for im in pil_images]
+        arrays: List["np.ndarray"] = []
+        for img in pil_images:
+            arrays.append(np.array(img))
+        return arrays
 
     # ---------- Live View ----------
     def start_live_view(self) -> None:
