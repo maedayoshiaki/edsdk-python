@@ -12,11 +12,10 @@ AEモードは多くの機種でSDKから変更不可のため指定していま
 from edsdk.camera_controller import CameraController
 import rawtopng
 import cv2
-import PIL.Image as Image
 import numpy as np
 
 
-def raw_processor(raw_bytes: bytes) -> Image.Image:
+def raw_processor(raw_bytes: bytes) -> np.ndarray:
     import io
     import rawpy
 
@@ -26,10 +25,12 @@ def raw_processor(raw_bytes: bytes) -> Image.Image:
         rgb = rawData.postprocess(
             use_camera_wb=True,
             no_auto_bright=True,
-            bright=5.0,
+            bright=1.0,
             gamma=(1.0, 1.0),
+            output_bps=16,
         )
-    return Image.fromarray(rgb)
+    print(f"raw image to PNG image done. shape={rgb.shape}, dtype={rgb.dtype}")
+    return rgb
 
 
 # プロパティイベント警告を抑制したい場合は register_property_events=False を指定
@@ -63,23 +64,12 @@ with CameraController(
     for p in paths:
         print("Saved:", p)
 
-    # example2: 撮影してPIL形式で取得、表示
-    images = cam.capture_pil()
-    # show images or process them as needed
-    for img in images:
-        img.show()
-
     # example3: ファイル名を完全指定して保存
     # 完全指定のファイル名で保存（拡張子はカメラ側の種類に合わせて自動付与されます）
     # 例: "my_shot" -> 実際の保存名は "my_shot.JPG" や "my_shot.CR3" など
     fixed = cam.capture(filename="my_shot")
     for p in fixed:
         print("Saved (fixed name):", p)
-
-    # example4: ライブビュー画像取得
-    # ライブビュー画像をPIL形式で取得して表示
-    live_img = cam.grab_live_view_pil()
-    live_img.show()
 
     # example5: RAW画像をPNGに変換して保存
     cam.set_properties(image_quality="LR")
@@ -99,10 +89,6 @@ with CameraController(
         cv2.waitKey(1000)
         cv2.destroyAllWindows()
 
-    # example7: RAW画像を指定したプロセッサで現像してPIL形式で取得
-    pil_imgs = cam.capture_pil(raw_processor=raw_processor)
-    for img in pil_imgs:
-        bgr_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-        cv2.imshow("Captured Image (PIL)", bgr_img)
-        cv2.waitKey(1000)
-        cv2.destroyAllWindows()
+    np_arrays = cam.capture_numpy(raw_processor=raw_processor)
+    for arr in np_arrays:
+        cv2.imwrite("captured_numpy.png", cv2.cvtColor(arr, cv2.COLOR_RGB2BGR))

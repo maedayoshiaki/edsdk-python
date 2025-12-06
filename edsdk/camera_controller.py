@@ -22,7 +22,6 @@ from typing import (
 
 # Only imported for type checking to avoid runtime cost if deps not installed
 if TYPE_CHECKING:  # pragma: no cover
-    from PIL import Image
     import numpy as np
 
 
@@ -71,57 +70,41 @@ class RawProcessor(Protocol):
         raw_bytes: Binary data of the RAW file (e.g., CR2, CR3).
 
     Returns:
-        Developed image as PIL.Image.Image (RGB mode recommended).
+        Developed image as numpy.ndarray (RGB; uint8/uint16 等を想定).
 
-    Example using rawpy:
+    Example using rawpy (8bit):
         ```python
         import io
         import rawpy
-        from PIL import Image
+        import numpy as np
 
-        def develop_raw(raw_bytes: bytes) -> Image.Image:
+        def develop_raw(raw_bytes: bytes) -> np.ndarray:
             with rawpy.imread(io.BytesIO(raw_bytes)) as raw:
                 rgb = raw.postprocess(
                     use_camera_wb=True,
                     output_bps=8,
                 )
-            return Image.fromarray(rgb)
-
-        # Usage
-        with CameraController() as cam:
-            images = cam.capture_pil(raw_processor=develop_raw)
+            return rgb  # shape: (H, W, 3), dtype=uint8
         ```
 
-    Example with custom settings:
+    Example using rawpy (16bit):
         ```python
-        class MyRawProcessor:
-            def __init__(self, gamma: float = 2.2):
-                self.gamma = gamma
+        import io
+        import rawpy
+        import numpy as np
 
-            def __call__(self, raw_bytes: bytes) -> Image.Image:
-                import io
-                import rawpy
-                import numpy as np
-                from PIL import Image
-
-                with rawpy.imread(io.BytesIO(raw_bytes)) as raw:
-                    rgb = raw.postprocess(gamma=(1, 1), output_bps=16)
-
-                # Apply custom gamma
-                rgb_float = rgb.astype(np.float32) / 65535.0
-                rgb_gamma = np.power(rgb_float, 1.0 / self.gamma)
-                rgb_8bit = (rgb_gamma * 255).clip(0, 255).astype(np.uint8)
-
-                return Image.fromarray(rgb_8bit)
-
-        # Usage
-        processor = MyRawProcessor(gamma=2.4)
-        images = cam.capture_pil(raw_processor=processor)
+        def develop_raw_16(raw_bytes: bytes) -> np.ndarray:
+            with rawpy.imread(io.BytesIO(raw_bytes)) as raw:
+                rgb = raw.postprocess(
+                    gamma=(1, 1),
+                    output_bps=16,
+                )
+            return rgb  # dtype=uint16
         ```
     """
 
-    def __call__(self, raw_bytes: bytes) -> "Image.Image":
-        """Process RAW bytes and return developed PIL Image."""
+    def __call__(self, raw_bytes: bytes) -> "np.ndarray":
+        """Process RAW bytes and return developed numpy array (RGB)."""
         ...
 
 
@@ -137,7 +120,7 @@ def _validate_raw_processor(processor: object) -> None:
     if not callable(processor):
         raise TypeError(
             "raw_processor must be callable.\n"
-            "Expected signature: (raw_bytes: bytes) -> PIL.Image.Image\n"
+            "Expected signature: (raw_bytes: bytes) -> numpy.ndarray\n"
             "See RawProcessor docstring for implementation examples."
         )
 
@@ -156,7 +139,7 @@ def _validate_raw_processor(processor: object) -> None:
             raise TypeError(
                 f"raw_processor must accept exactly 1 required argument (raw_bytes), "
                 f"but got {len(params)} required argument(s).\n"
-                "Expected signature: (raw_bytes: bytes) -> PIL.Image.Image"
+                "Expected signature: (raw_bytes: bytes) -> numpy.ndarray"
             )
     except (ValueError, TypeError):
         # Some built-in callables don't support signature inspection
@@ -891,7 +874,7 @@ class CameraController:
                         pass
         return data_list
 
-    def capture_pil(
+    def capture_numpy(
         self,
         shots: int = 1,
         timeout: float = 5.0,
@@ -901,8 +884,10 @@ class CameraController:
         retry_delay: float = 0.3,
         keep_files: bool = False,
         raw_processor: Optional[RawProcessor] = None,
-    ) -> List["Image.Image"]:
-        """Capture and return a list of PIL Images (requires Pillow).
+    ) -> List["np.ndarray"]:
+        """Capture and return a list of numpy arrays (RGB).
+
+        こちらが設計の軸になるメソッドです。
 
         Args:
             shots: Number of shots to capture.
@@ -913,22 +898,33 @@ class CameraController:
             keep_files: If True, keep captured files on disk.
             raw_processor: Callback to develop RAW images.
                            Must conform to RawProcessor protocol:
-                           (raw_bytes: bytes) -> PIL.Image.Image
+                           (raw_bytes: bytes) -> numpy.ndarray
                            Required if camera is set to RAW or RAW+JPEG mode.
                            See RawProcessor docstring for examples.
 
         Returns:
-            List of PIL Image objects.
+            List of numpy arrays (RGB format, dtype 任意).
 
         Raises:
             ValueError: If RAW capture is enabled but no raw_processor provided.
-            TypeError: If raw_processor has invalid signature.
-            RuntimeError: If Pillow is not installed or camera session not open.
+            TypeError: If raw_processor has invalid signature or returns non-ndarray.
+            RuntimeError: If numpy is not installed or camera session not open.
         """
         try:
-            from PIL import Image  # type: ignore
+            import numpy as np  # type: ignore
         except Exception as e:
-            raise RuntimeError("Pillow (PIL) is required for capture_pil()") from e
+            raise RuntimeError("numpy is required for capture_numpy()") from e
+
+        # JPEG/HEIF デコード用の代替ライブラリ（imageio.v3）を準備
+        try:
+            import imageio.v3 as iio  # type: ignore
+        except Exception as e:
+            # RAW のみを raw_processor で処理するモードなら許容し、
+            # JPEG/HEIF を含む場合に備えて明示的なエラーメッセージを出す
+            iio = None  # type: ignore[assignment]
+            imageio_import_error = e
+        else:
+            imageio_import_error = None
 
         # Check current ImageQuality setting before capture
         if self._cam is None:
@@ -964,25 +960,24 @@ class CameraController:
             retry_delay=retry_delay,
         )
 
-        images: List["Image.Image"] = []
+        arrays: List["np.ndarray"] = []
         for p in paths:
             try:
                 with open(p, "rb") as f:
                     raw_bytes = f.read()
 
-                # Determine if this specific file is RAW by extension
                 if _is_raw_file(p):
                     # RAW file: use processor
                     if raw_processor is not None:
                         self._log(
                             f"Processing RAW file with raw_processor: {os.path.basename(p)}"
                         )
-                        img = raw_processor(raw_bytes)
+                        arr = raw_processor(raw_bytes)
                         # Validate return type
-                        if not isinstance(img, Image.Image):
+                        if not isinstance(arr, np.ndarray):
                             raise TypeError(
-                                f"raw_processor must return PIL.Image.Image, "
-                                f"but got {type(img).__name__}.\n"
+                                f"raw_processor must return numpy.ndarray, "
+                                f"but got {type(arr).__name__}.\n"
                                 "See RawProcessor docstring for correct implementation."
                             )
                     else:
@@ -992,14 +987,20 @@ class CameraController:
                             "but no raw_processor provided."
                         )
                 else:
-                    # JPEG/HEIF: let Pillow handle it
-                    self._log(f"Loading image with Pillow: {os.path.basename(p)}")
-                    img = Image.open(io.BytesIO(raw_bytes))
-                    img.load()  # fully load to detach from BytesIO
+                    # JPEG/HEIF: decode via imageio instead of Pillow
+                    if iio is None:
+                        raise RuntimeError(
+                            "imageio (imageio.v3) is required to decode JPEG/HEIF "
+                            "for capture_numpy(). Install via 'pip install imageio'."
+                        ) from imageio_import_error
+                    self._log(
+                        f"Loading image with imageio -> numpy: {os.path.basename(p)}"
+                    )
+                    # imageio.v3.imread は bytes も扱える
+                    arr = iio.imread(raw_bytes)
 
-                images.append(img)
+                arrays.append(arr)
             except Exception as e:
-                # Re-raise with more context
                 if _is_raw_file(p) and raw_processor is None:
                     raise RuntimeError(
                         f"Failed to process {os.path.basename(p)}. "
@@ -1013,58 +1014,6 @@ class CameraController:
                     except Exception:
                         pass
 
-        return images
-
-    def capture_numpy(
-        self,
-        shots: int = 1,
-        timeout: float = 5.0,
-        *,
-        interval: float = 0.0,
-        retry: int = 0,
-        retry_delay: float = 0.3,
-        keep_files: bool = False,
-        raw_processor: Optional[RawProcessor] = None,
-    ) -> List["np.ndarray"]:
-        """Capture and return a list of numpy arrays (requires numpy).
-
-        Args:
-            shots: Number of shots to capture.
-            timeout: Timeout in seconds for each shot transfer.
-            interval: Interval in seconds between shots.
-            retry: Number of retries on timeout.
-            retry_delay: Delay in seconds between retries.
-            keep_files: If True, keep captured files on disk.
-            raw_processor: Callback to develop RAW images.
-                           Must conform to RawProcessor protocol:
-                           (raw_bytes: bytes) -> PIL.Image.Image
-                           Required if camera is set to RAW or RAW+JPEG mode.
-                           See RawProcessor docstring for examples.
-
-        Returns:
-            List of numpy arrays (RGB format).
-
-        Raises:
-            ValueError: If RAW capture is enabled but no raw_processor provided.
-            TypeError: If raw_processor has invalid signature.
-            RuntimeError: If numpy is not installed or camera session not open.
-        """
-        try:
-            import numpy as np  # type: ignore
-        except Exception as e:
-            raise RuntimeError("numpy is required for capture_numpy()") from e
-        pil_images = self.capture_pil(
-            shots=shots,
-            timeout=timeout,
-            interval=interval,
-            retry=retry,
-            retry_delay=retry_delay,
-            keep_files=keep_files,
-            raw_processor=raw_processor,
-        )
-        arrays: List["np.ndarray"] = []
-        for img in pil_images:
-            arrays.append(np.array(img))
         return arrays
 
     # ---------- Live View ----------
@@ -1159,32 +1108,32 @@ class CameraController:
             raise last_exc
         raise RuntimeError("Unexpected live view failure without exception")
 
-    def grab_live_view_pil(self) -> "Image.Image":
-        """Grab one live-view frame and return as PIL Image (requires Pillow)."""
-        try:
-            from PIL import Image  # type: ignore
-        except Exception as e:
-            raise RuntimeError(
-                "Pillow (PIL) is required for grab_live_view_pil()"
-            ) from e
-        data = self.grab_live_view_frame()
-        if isinstance(data, str):
-            with open(data, "rb") as f:
-                raw = f.read()
-            img = Image.open(io.BytesIO(raw))
-        else:
-            img = Image.open(io.BytesIO(data))
-        img.load()
-        return img
-
     def grab_live_view_numpy(self) -> "np.ndarray":
-        """Grab one live-view frame and return as numpy array (requires numpy)."""
+        """Grab one live-view frame and return as numpy array (requires numpy and imageio)."""
         try:
             import numpy as np  # type: ignore
         except Exception as e:
             raise RuntimeError("numpy is required for grab_live_view_numpy()") from e
-        pil_img = self.grab_live_view_pil()
-        return np.array(pil_img)
+
+        try:
+            import imageio.v3 as iio  # type: ignore
+        except Exception as e:
+            raise RuntimeError(
+                "imageio (imageio.v3) is required for grab_live_view_numpy(). "
+                "Install via 'pip install imageio'."
+            ) from e
+
+        data = self.grab_live_view_frame()
+        if isinstance(data, str):
+            # ファイルパスが返ってきた場合はファイルから読む
+            with open(data, "rb") as f:
+                raw = f.read()
+        else:
+            raw = data
+
+        # imageio で bytes から直接 numpy 配列へ
+        arr = iio.imread(raw)
+        return arr
 
     # ---------- asyncio event queue ----------
     def enable_async(
