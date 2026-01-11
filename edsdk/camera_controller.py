@@ -1068,23 +1068,55 @@ class CameraController:
                         f"Live view saved: {save_path} (attempt {attempt}/{MAX_ATTEMPTS})"
                     )
                     return save_path
-                # Fallback: save to temp file and read bytes
-                tmp_path = os.path.join(self.save_dir, f"evf_{uuid.uuid4().hex}.jpg")
-                out_stream = edsdk.CreateFileStream(
-                    tmp_path, FileCreateDisposition.CreateAlways, Access.ReadWrite
-                )
-                evf_image = edsdk.CreateEvfImageRef(out_stream)
-                edsdk.DownloadEvfImage(self._cam, evf_image)
-                with open(tmp_path, "rb") as f:
-                    data = f.read()
-                try:
-                    os.remove(tmp_path)
-                except Exception:
-                    pass
-                self._log(
-                    f"Live view grabbed: {len(data)} bytes (attempt {attempt}/{MAX_ATTEMPTS})"
-                )
-                return data
+                # Default: download EVF frame into a pre-allocated in-memory buffer.
+                # This avoids creating any temporary files on disk.
+                buf_size = 8 * 1024 * 1024  # 8 MiB initial buffer
+                max_buf_size = 64 * 1024 * 1024  # 64 MiB cap
+                last_buf_exc: Optional[Exception] = None
+
+                while buf_size <= max_buf_size:
+                    try:
+                        buf = bytearray(buf_size)
+                        out_stream = edsdk.CreateMemoryStreamFromPointer(buf)
+                        evf_image = edsdk.CreateEvfImageRef(out_stream)
+                        edsdk.DownloadEvfImage(self._cam, evf_image)
+
+                        # Prefer position (bytes written). Fallback to length.
+                        n = int(edsdk.GetPosition(out_stream))
+                        if n <= 0:
+                            n = int(edsdk.GetLength(out_stream))
+                        if n <= 0:
+                            raise RuntimeError(
+                                "Live view download returned empty buffer"
+                            )
+                        if n > len(buf):
+                            raise RuntimeError(
+                                f"Live view wrote {n} bytes into a {len(buf)} byte buffer"
+                            )
+
+                        data = bytes(memoryview(buf)[:n])
+                        self._log(
+                            f"Live view grabbed: {len(data)} bytes (attempt {attempt}/{MAX_ATTEMPTS})"
+                        )
+                        return data
+                    except Exception as e:
+                        # If buffer is too small, retry with a larger one.
+                        last_buf_exc = e
+                        msg = str(e)
+                        code = getattr(e, "code", None)
+                        might_be_too_small = (
+                            (code == 0x00000065)  # EDS_ERR_MEM_ALLOC_FAILED (common)
+                            or ("BUFFER" in msg.upper())
+                            or ("MEM" in msg.upper() and "ALLOC" in msg.upper())
+                        )
+                        if not might_be_too_small:
+                            raise
+                        buf_size *= 2
+                        continue
+
+                if last_buf_exc is not None:
+                    raise last_buf_exc
+                raise RuntimeError("Live view download failed without exception")
             except Exception as e:  # Catch SDK error
                 code = getattr(e, "code", None)
                 msg = str(e)
