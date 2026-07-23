@@ -52,7 +52,8 @@ except ImportError as exc:
         raise ImportError(
             "Failed to import edsdk.api. Install Canon EDSDK separately and set "
             "EDSDK_PYTHON_DLL_DIR or CANON_EDSDK_DLL_DIR to the folder containing "
-            "EDSDK.dll and EdsImage.dll."
+            "EDSDK.dll and EdsImage.dll. The SDK is not bundled with this package: "
+            "apply for it through Canon's developer programme for your region."
         ) from exc
     raise
 

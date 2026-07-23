@@ -10,6 +10,39 @@ By default, the wheel built from this fork does not bundle Canon's proprietary D
 Install Canon EDSDK separately and point the package to the DLL folder with either
 `EDSDK_PYTHON_DLL_DIR` or `CANON_EDSDK_DLL_DIR`.
 
+## Install from GitHub Releases (consumer projects)
+
+Prebuilt Windows wheels (64-bit, Python 3.11 / 3.12 / 3.13) are attached to
+[GitHub Releases](https://github.com/maedayoshiaki/edsdk-python/releases).
+The wheels contain only this project's code — Canon's EDSDK is **not** included.
+
+Add to your `pyproject.toml` (works with both pip and uv):
+
+```toml
+dependencies = [
+  "edsdk-python @ https://github.com/maedayoshiaki/edsdk-python/releases/download/v0.1.7/edsdk_python-0.1.7-cp313-cp313-win_amd64.whl ; python_version == '3.13'",
+  "edsdk-python @ https://github.com/maedayoshiaki/edsdk-python/releases/download/v0.1.7/edsdk_python-0.1.7-cp312-cp312-win_amd64.whl ; python_version == '3.12'",
+  "edsdk-python @ https://github.com/maedayoshiaki/edsdk-python/releases/download/v0.1.7/edsdk_python-0.1.7-cp311-cp311-win_amd64.whl ; python_version == '3.11'",
+]
+```
+
+Or install a single wheel directly:
+
+```cmd
+pip install https://github.com/maedayoshiaki/edsdk-python/releases/download/v0.1.7/edsdk_python-0.1.7-cp313-cp313-win_amd64.whl
+```
+
+You still need Canon EDSDK itself: apply for it through Canon's developer
+programme for your region, then point this package at the DLLs before
+importing:
+
+```cmd
+set EDSDK_PYTHON_DLL_DIR=C:\path\to\EDSDK_64\Dll
+```
+
+Vendoring a wheel file into your repository (the previous workflow) keeps
+working — the release URLs simply serve the same wheel.
+
 ## Obtain the EDSDK from Canon
 
 Before you can use this library you need to obtain the EDSDK library from Canon. You can do so via their developers program:
@@ -120,6 +153,22 @@ This fork is intended for redistribution without Canon SDK binaries.
 6. Deliver the wheel by itself.
 7. On the client machine, install Canon EDSDK separately and set `EDSDK_PYTHON_DLL_DIR`
    or `CANON_EDSDK_DLL_DIR` to the DLL folder.
+
+## Releasing (maintainers)
+
+Releases are built locally on a machine that has the Canon SDK under
+`dependencies/`, MSVC, `uv`, and an authenticated `gh` CLI. Canon SDK files
+are never uploaded — only the wheels containing this project's code.
+
+1. Verify the build on your branch:
+   `python scripts/release.py --dry-run`
+   (builds Python 3.11/3.12/3.13 wheels and runs the unit tests against each
+   wheel in a throwaway venv).
+2. Merge to `main`. The released version must match `pyproject.toml` on
+   `origin/main` — the script checks this.
+3. Create the release: `python scripts/release.py`
+   (creates tag `v{version}`, uploads the wheels from `dist/`, and prints the
+   consumer `pyproject.toml` snippet).
 
 ## Exposure control (Av / Tv / ISO)
 
