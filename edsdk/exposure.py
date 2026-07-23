@@ -237,3 +237,260 @@ _ISO_BY_CODE = {e.code: e for e in ISO_SPEEDS}
 
 _TV_BULB = next(e for e in SHUTTER_SPEEDS if e.seconds is None)
 _ISO_AUTO = next(e for e in ISO_SPEEDS if e.value is None)
+
+
+# ---------------------------------------------------------------------------
+# Parsing user input
+# ---------------------------------------------------------------------------
+# Each parser returns ("entry", table_entry, label) for explicit/exact input
+# or ("numeric", target_ev, label) for photographic numeric values.
+_ParseResult = Tuple[str, object, str]
+
+
+def _parse_av_value(value: ApertureLike) -> _ParseResult:
+    if isinstance(value, Aperture):
+        return ("entry", value, str(value))
+    if isinstance(value, bool):
+        raise ValueError(f"Cannot parse Av value {value!r}")
+    if isinstance(value, (int, float)):
+        f_number = float(value)
+        return ("numeric", _av_ev(f_number), f"f/{f_number:g}")
+    if isinstance(value, str):
+        text = value.strip()
+        if text:
+            matches = [e for e in APERTURES if e.display.lower() == text.lower()]
+            if matches:
+                entry = min(matches, key=lambda e: e.code)
+                return ("entry", entry, str(entry))
+            cleaned = text.lower()
+            if cleaned.startswith("f/"):
+                cleaned = cleaned[2:]
+            elif cleaned.startswith("f") and len(cleaned) > 1:
+                cleaned = cleaned[1:]
+            cleaned = cleaned.strip().rstrip("f").strip()
+            try:
+                f_number = float(cleaned)
+            except ValueError:
+                raise ValueError(f"Cannot parse Av value {value!r}") from None
+            return ("numeric", _av_ev(f_number), f"f/{f_number:g}")
+    raise ValueError(f"Cannot parse Av value {value!r}")
+
+
+def _parse_tv_value(value: ShutterSpeedLike) -> _ParseResult:
+    if isinstance(value, ShutterSpeed):
+        return ("entry", value, value.display)
+    if isinstance(value, bool):
+        raise ValueError(f"Cannot parse Tv value {value!r}")
+    if isinstance(value, (int, float)):
+        seconds = float(value)
+        return ("numeric", _tv_ev(seconds), f"{seconds:g}s")
+    if isinstance(value, str):
+        text = value.strip()
+        if text:
+            low = text.lower()
+            if low == "bulb":
+                return ("entry", _TV_BULB, _TV_BULB.display)
+            matches = [e for e in SHUTTER_SPEEDS if e.display.lower() == low]
+            if matches:
+                entry = min(matches, key=lambda e: e.code)
+                return ("entry", entry, entry.display)
+            cleaned = low
+            if cleaned.endswith("sec"):
+                cleaned = cleaned[:-3].strip()
+            elif cleaned.endswith("s"):
+                cleaned = cleaned[:-1].strip()
+            if "/" in cleaned:
+                num, _, den = cleaned.partition("/")
+                try:
+                    seconds = float(num) / float(den)
+                except (ValueError, ZeroDivisionError):
+                    raise ValueError(f"Cannot parse Tv value {value!r}") from None
+            else:
+                try:
+                    seconds = float(cleaned)
+                except ValueError:
+                    raise ValueError(f"Cannot parse Tv value {value!r}") from None
+            return ("numeric", _tv_ev(seconds), f"{seconds:g}s")
+    raise ValueError(f"Cannot parse Tv value {value!r}")
+
+
+def _parse_iso_value(value: ISOSpeedLike) -> _ParseResult:
+    if isinstance(value, ISOSpeed):
+        return ("entry", value, str(value))
+    if isinstance(value, bool):
+        raise ValueError(f"Cannot parse ISO value {value!r}")
+    if isinstance(value, int):
+        if value == 0:
+            return ("entry", _ISO_AUTO, str(_ISO_AUTO))
+        return ("numeric", _iso_ev(value), f"ISO {value}")
+    if isinstance(value, float):
+        if value.is_integer():
+            return _parse_iso_value(int(value))
+        raise ValueError(f"ISO value must be an integer, got {value!r}")
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("auto", "isoauto"):
+            return ("entry", _ISO_AUTO, str(_ISO_AUTO))
+        if text.startswith("iso"):
+            text = text[3:].strip()
+        if text.isdigit():
+            return _parse_iso_value(int(text))
+    raise ValueError(f"Cannot parse ISO value {value!r}")
+
+
+# ---------------------------------------------------------------------------
+# Resolution against camera-supported codes
+# ---------------------------------------------------------------------------
+
+
+def _unsupported_message(
+    kind: str,
+    label: str,
+    numeric_supported: List,
+    target_ev: Optional[float],
+    fmt: Callable,
+    nearest: bool,
+    has_camera: bool,
+) -> str:
+    if has_camera:
+        lines = [f"{kind} {label} is not supported by this camera/lens."]
+    else:
+        lines = [f"{kind} {label} does not match any EDSDK {kind} value."]
+    if numeric_supported:
+        lo = min(numeric_supported, key=lambda e: e._ev())
+        hi = max(numeric_supported, key=lambda e: e._ev())
+        lines.append(
+            f"  Supported range: {fmt(lo)} - {fmt(hi)}"
+            f" ({len(numeric_supported)} values)"
+        )
+        if target_ev is not None:
+            near = min(
+                numeric_supported,
+                key=lambda e: (abs(e._ev() - target_ev), e.code),
+            )
+            lines.append(f"  Nearest supported: {fmt(near)}")
+    if not nearest and target_ev is not None:
+        lines.append("  Hint: pass nearest=True to snap to the nearest supported value.")
+    return "\n".join(lines)
+
+
+def _resolve(
+    kind: str,
+    entries: Sequence,
+    parsed: _ParseResult,
+    supported_codes: Sequence[int],
+    nearest: bool,
+    tolerance_ev: float,
+    fmt: Callable,
+):
+    tag, payload, label = parsed
+    supported_set = {int(c) for c in supported_codes}
+    has_camera = bool(supported_set)
+    if has_camera:
+        supported = [e for e in entries if e.code in supported_set]
+        if not supported:
+            # Descriptor returned only codes missing from our table
+            supported = list(entries)
+    else:
+        supported = list(entries)
+    supported_code_set = {e.code for e in supported}
+
+    if tag == "entry":
+        if payload.code in supported_code_set:
+            return payload
+        target_ev = payload._ev()
+    else:
+        target_ev = payload
+
+    if target_ev is not None:
+        candidates = [
+            e
+            for e in entries
+            if e._ev() is not None and abs(e._ev() - target_ev) <= tolerance_ev
+        ]
+        candidates.sort(key=lambda e: (abs(e._ev() - target_ev), e.code))
+        for candidate in candidates:
+            if candidate.code in supported_code_set:
+                return candidate
+
+    numeric_supported = [e for e in supported if e._ev() is not None]
+    if nearest and target_ev is not None and numeric_supported:
+        return min(
+            numeric_supported,
+            key=lambda e: (abs(e._ev() - target_ev), e.code),
+        )
+
+    raise ValueError(
+        _unsupported_message(
+            kind, label, numeric_supported, target_ev, fmt, nearest, has_camera
+        )
+    )
+
+
+def resolve_av(
+    value: ApertureLike,
+    supported_codes: Sequence[int] = (),
+    *,
+    nearest: bool = False,
+) -> Aperture:
+    """Resolve *value* to an :class:`Aperture`.
+
+    Args:
+        value: f-number, string (``"f/5.6"``, ``"5.6"``, table display), or Aperture.
+        supported_codes: Camera-supported Av codes from ``GetPropertyDesc``.
+            Empty means "match against the full EDSDK table".
+        nearest: Snap to the nearest supported value (EV distance) instead of
+            raising when *value* is unsupported.
+
+    Raises:
+        ValueError: Unparseable input, or unsupported value with ``nearest=False``.
+    """
+    return _resolve(
+        "Av",
+        APERTURES,
+        _parse_av_value(value),
+        supported_codes,
+        nearest,
+        _EV_TOLERANCE,
+        lambda e: f"f/{e.display}",
+    )
+
+
+def resolve_tv(
+    value: ShutterSpeedLike,
+    supported_codes: Sequence[int] = (),
+    *,
+    nearest: bool = False,
+) -> ShutterSpeed:
+    """Resolve *value* to a :class:`ShutterSpeed`. See :func:`resolve_av`."""
+    return _resolve(
+        "Tv",
+        SHUTTER_SPEEDS,
+        _parse_tv_value(value),
+        supported_codes,
+        nearest,
+        _EV_TOLERANCE,
+        lambda e: e.display,
+    )
+
+
+def resolve_iso(
+    value: ISOSpeedLike,
+    supported_codes: Sequence[int] = (),
+    *,
+    nearest: bool = False,
+) -> ISOSpeed:
+    """Resolve *value* to an :class:`ISOSpeed`. See :func:`resolve_av`.
+
+    Strict matching requires an exact ISO value; ``nearest=True`` snaps in
+    EV space. ``0`` / ``"auto"`` selects ISO Auto.
+    """
+    return _resolve(
+        "ISO",
+        ISO_SPEEDS,
+        _parse_iso_value(value),
+        supported_codes,
+        nearest,
+        _ISO_EV_TOLERANCE,
+        lambda e: f"ISO {e.display}",
+    )
