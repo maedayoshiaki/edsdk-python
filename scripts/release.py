@@ -17,11 +17,13 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import tomllib
+import zipfile
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -107,6 +109,35 @@ def check_sdk_files(repo_root: Path) -> list[str]:
     return [rel for rel in SDK_FILES if not (repo_root / rel).is_file()]
 
 
+def invalid_python_values(pythons: Sequence[str]) -> list[str]:
+    """Return --pythons entries that are not in X.Y format (e.g. '3.13')."""
+    return [value for value in pythons if not re.fullmatch(r"\d+\.\d+", value)]
+
+
+_FORBIDDEN_BASENAME_RE = re.compile(r"^(?:edsdk|edsimage)(?:\.|$)", re.IGNORECASE)
+
+
+def forbidden_wheel_entries(wheel_path: Path) -> list[str]:
+    """Return wheel archive member names that look like Canon SDK binaries.
+
+    Flags any entry whose name ends with .dll, or whose basename is exactly
+    EDSDK/EdsImage (any extension, case-insensitive) -- e.g. EDSDK.dll,
+    EDSDK.lib, EdsImage.dll -- so a Canon SDK file accidentally bundled into
+    a wheel is caught before it is ever uploaded. The basename check
+    requires "edsdk"/"edsimage" to be the whole stem (followed by "." or end
+    of string) so it does not misfire on this project's own source files
+    such as edsdk_python.cpp / edsdk_utils.h, which merely start with the
+    same letters.
+    """
+    forbidden: list[str] = []
+    with zipfile.ZipFile(wheel_path) as zf:
+        for name in zf.namelist():
+            basename = Path(name).name
+            if basename.lower().endswith(".dll") or _FORBIDDEN_BASENAME_RE.match(basename):
+                forbidden.append(name)
+    return forbidden
+
+
 def run(
     cmd: Sequence[object],
     *,
@@ -186,7 +217,15 @@ def create_release(
     version: str,
     pythons: Sequence[str],
     wheels: Sequence[Path],
+    target: str,
 ) -> None:
+    """Create the GitHub Release, tagging exactly the built commit.
+
+    ``target`` is the local HEAD sha the wheels were built from: passing it
+    explicitly to ``gh release create --target`` guarantees the tag points at
+    that commit even with ``--allow-branch`` (gh fails if the sha isn't
+    pushed to the repo, which is the correct behaviour).
+    """
     notes = release_notes(repo, version, pythons)
     run(
         [
@@ -201,6 +240,8 @@ def create_release(
             f"v{version}",
             "--notes",
             notes,
+            "--target",
+            target,
         ],
         cwd=repo_root,
     )
@@ -221,7 +262,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--pythons", nargs="+", default=list(DEFAULT_PYTHONS), metavar="X.Y"
     )
-    parser.add_argument("--repo", default=DEFAULT_REPO, metavar="OWNER/NAME")
+    parser.add_argument(
+        "--repo",
+        default=DEFAULT_REPO,
+        metavar="OWNER/NAME",
+        help=(
+            "GitHub repo to create the release on (default: "
+            f"{DEFAULT_REPO}). Note: the git guards (clean tree, branch, "
+            "existing tag, HEAD==origin/main) always check the local "
+            "checkout's own origin remote, not this value; --repo is for "
+            "testing against a fork, not for releasing elsewhere."
+        ),
+    )
     parser.add_argument(
         "--allow-branch",
         action="store_true",
@@ -235,6 +287,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     repo_root = Path(__file__).resolve().parent.parent
 
     problems = [f"missing Canon SDK file: {rel}" for rel in check_sdk_files(repo_root)]
+    for value in invalid_python_values(args.pythons):
+        problems.append(f"invalid --pythons value: {value!r} (expected X.Y like 3.13)")
     required_tools = ("uv",) if args.dry_run else ("uv", "gh")
     for tool in required_tools:
         if shutil.which(tool) is None:
@@ -277,9 +331,29 @@ def main(argv: Sequence[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 1
+        if not args.allow_branch:
+            local_head = git_output(repo_root, "rev-parse", "HEAD")
+            origin_main_head = git_output(repo_root, "rev-parse", "origin/main")
+            if local_head != origin_main_head:
+                print(
+                    "ERROR: local HEAD is not origin/main (build must match "
+                    "the released commit); git pull/push first or pass "
+                    "--allow-branch",
+                    file=sys.stderr,
+                )
+                return 1
         run(["gh", "auth", "status"], capture=True)
 
     wheels = build_wheels(repo_root, version, args.pythons)
+
+    for wheel in wheels:
+        entries = forbidden_wheel_entries(wheel)
+        if entries:
+            print(
+                f"ERROR: wheel {wheel.name} contains forbidden files: {entries}",
+                file=sys.stderr,
+            )
+            return 1
 
     if args.skip_smoke:
         print("Skipping smoke tests (--skip-smoke)")
@@ -293,7 +367,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         for wheel in wheels:
             print(f"  {wheel.name}")
     else:
-        create_release(repo_root, args.repo, version, args.pythons, wheels)
+        head_sha = git_output(repo_root, "rev-parse", "HEAD")
+        create_release(repo_root, args.repo, version, args.pythons, wheels, head_sha)
         print(
             f"Release v{version} created: "
             f"https://github.com/{args.repo}/releases/tag/v{version}"
@@ -312,4 +387,6 @@ if __name__ == "__main__":
         print(f"ERROR: command failed with exit code {exc.returncode}: {cmd}", file=sys.stderr)
         if exc.stderr:
             print(exc.stderr, file=sys.stderr)
+        if exc.stdout:
+            print(exc.stdout, file=sys.stderr)
         sys.exit(1)

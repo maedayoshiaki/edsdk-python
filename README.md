@@ -158,15 +158,17 @@ This fork is intended for redistribution without Canon SDK binaries.
 
 Releases are built locally on a machine that has the Canon SDK under
 `dependencies/`, MSVC, `uv`, and an authenticated `gh` CLI. Canon SDK files
-are never uploaded — only the wheels containing this project's code.
+are never uploaded — only the wheels containing this project's code. Run the
+script from PowerShell or cmd, not Git Bash/MSYS — MSVC discovery fails
+under MSYS on this machine.
 
 1. Verify the build on your branch:
-   `python scripts/release.py --dry-run`
+   `.venv\Scripts\python.exe scripts\release.py --dry-run`
    (builds Python 3.11/3.12/3.13 wheels and runs the unit tests against each
    wheel in a throwaway venv).
 2. Merge to `main`. The released version must match `pyproject.toml` on
    `origin/main` — the script checks this.
-3. Create the release: `python scripts/release.py`
+3. Create the release: `.venv\Scripts\python.exe scripts\release.py`
    (creates tag `v{version}`, uploads the wheels from `dist/`, and prints the
    consumer `pyproject.toml` snippet).
 

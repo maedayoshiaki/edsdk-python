@@ -2,6 +2,7 @@
 
 import sys
 import tomllib
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -85,3 +86,58 @@ class TestCheckSdkFiles:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"")
         assert release.check_sdk_files(tmp_path) == []
+
+
+class TestInvalidPythonValues:
+    def test_all_valid(self):
+        assert release.invalid_python_values(["3.11", "3.12"]) == []
+
+    def test_some_invalid(self):
+        # "3.9" is valid in format even though it's not in DEFAULT_PYTHONS.
+        assert release.invalid_python_values(["311", "three", "3.9"]) == [
+            "311",
+            "three",
+        ]
+
+
+class TestForbiddenWheelEntries:
+    def test_clean_wheel_reports_nothing(self, tmp_path):
+        wheel = tmp_path / "clean.whl"
+        with zipfile.ZipFile(wheel, "w") as zf:
+            zf.writestr("edsdk/api.pyd", b"")
+            zf.writestr("edsdk/__init__.py", b"")
+        assert release.forbidden_wheel_entries(wheel) == []
+
+    def test_dll_entries_reported_case_insensitively(self, tmp_path):
+        wheel = tmp_path / "dirty.whl"
+        with zipfile.ZipFile(wheel, "w") as zf:
+            zf.writestr("edsdk/EDSDK.dll", b"")
+            zf.writestr("edsdk/EdsImage.dll", b"")
+            zf.writestr("edsdk/eDsDk.DLL", b"")
+        entries = release.forbidden_wheel_entries(wheel)
+        assert "edsdk/EDSDK.dll" in entries
+        assert "edsdk/EdsImage.dll" in entries
+        assert "edsdk/eDsDk.DLL" in entries
+        assert len(entries) == 3
+
+    def test_non_dll_canon_basenames_reported(self, tmp_path):
+        # Non-.dll Canon SDK files (e.g. accidentally bundled headers/libs)
+        # must still be caught by the basename check.
+        wheel = tmp_path / "dirty.whl"
+        with zipfile.ZipFile(wheel, "w") as zf:
+            zf.writestr("edsdk/EDSDK.lib", b"")
+            zf.writestr("edsdk/EDSDK.h", b"")
+        entries = release.forbidden_wheel_entries(wheel)
+        assert "edsdk/EDSDK.lib" in entries
+        assert "edsdk/EDSDK.h" in entries
+
+    def test_project_source_files_not_misflagged(self, tmp_path):
+        # edsdk_python.cpp / edsdk_utils.h etc. merely start with "edsdk" but
+        # are this project's own source files, not Canon SDK binaries.
+        wheel = tmp_path / "clean.whl"
+        with zipfile.ZipFile(wheel, "w") as zf:
+            zf.writestr("edsdk/edsdk_python.cpp", b"")
+            zf.writestr("edsdk/edsdk_python.h", b"")
+            zf.writestr("edsdk/edsdk_utils.cpp", b"")
+            zf.writestr("edsdk/edsdk_utils.h", b"")
+        assert release.forbidden_wheel_entries(wheel) == []
