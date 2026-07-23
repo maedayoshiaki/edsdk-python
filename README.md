@@ -121,6 +121,31 @@ This fork is intended for redistribution without Canon SDK binaries.
 7. On the client machine, install Canon EDSDK separately and set `EDSDK_PYTHON_DLL_DIR`
    or `CANON_EDSDK_DLL_DIR` to the DLL folder.
 
+## Exposure control (Av / Tv / ISO)
+
+`CameraController` exposes camera-aware exposure APIs. Values can be given
+as numbers (f-number / seconds / ISO value), strings (`"1/125"`, `"f/5.6"`,
+`"auto"`), or table entries obtained from `supported_*()`.
+
+```python
+from edsdk.camera_controller import CameraController
+
+with CameraController() as cam:
+    cam.supported_av()             # lens-dependent list, e.g. [f/3.5 ... f/22]
+    cam.set_av(5.6)                # strict: raises ValueError if unsupported
+    cam.set_tv(1 / 125)            # returns the value the camera reports back
+    cam.set_iso(400)
+    cam.set_av(2.8, nearest=True)  # snaps to nearest supported (e.g. f/3.5)
+
+    # Legacy API keeps working and uses the same engine:
+    cam.set_properties(av="5", tv="1/30", iso="500", nearest=True)
+```
+
+Unsupported values raise `ValueError` listing the supported range and the
+nearest candidate. Pass `nearest=True` to snap automatically (matching is
+done in EV / log2 space). `Bulb` and ISO `Auto` are never chosen by
+`nearest`; request them explicitly (`"bulb"` / `"auto"`).
+
 ## Troubleshooting
 
 If you see errors like:
