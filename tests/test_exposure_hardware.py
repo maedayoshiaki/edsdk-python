@@ -30,9 +30,20 @@ def cam():
         try:
             yield controller
         finally:
-            controller.set_av(original[0])
-            controller.set_tv(original[1])
-            controller.set_iso(original[2])
+            # Best-effort restore: attempt each of Av/Tv/ISO independently so
+            # a transient EDSDK error on one call cannot skip the others.
+            try:
+                controller.set_av(original[0])
+            except Exception as exc:
+                print(f"WARNING: failed to restore Av: {exc}")
+            try:
+                controller.set_tv(original[1])
+            except Exception as exc:
+                print(f"WARNING: failed to restore Tv: {exc}")
+            try:
+                controller.set_iso(original[2])
+            except Exception as exc:
+                print(f"WARNING: failed to restore ISO: {exc}")
     finally:
         controller.__exit__(None, None, None)
 
