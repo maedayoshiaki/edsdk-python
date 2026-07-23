@@ -132,7 +132,7 @@ from edsdk.camera_controller import CameraController
 
 with CameraController() as cam:
     cam.supported_av()             # lens-dependent list, e.g. [f/3.5 ... f/22]
-    cam.set_av(5.6)                # strict: raises ValueError if unsupported
+    cam.set_av(5.6)                # strict: ValueError if not supported (±1/4 EV absorbed)
     cam.set_tv(1 / 125)            # returns the value the camera reports back
     cam.set_iso(400)
     cam.set_av(2.8, nearest=True)  # snaps to nearest supported (e.g. f/3.5)
@@ -142,7 +142,9 @@ with CameraController() as cam:
 ```
 
 Unsupported values raise `ValueError` listing the supported range and the
-nearest candidate. Pass `nearest=True` to snap automatically (matching is
+nearest candidate. Numeric Av/Tv inputs within a quarter stop (0.25 EV) of a
+supported value are treated as that value even in strict mode; ISO requires
+an exact value. Pass `nearest=True` to snap automatically (matching is
 done in EV / log2 space). `Bulb` and ISO `Auto` are never chosen by
 `nearest`; request them explicitly (`"bulb"` / `"auto"`).
 

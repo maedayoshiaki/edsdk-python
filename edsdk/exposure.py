@@ -316,13 +316,13 @@ def _parse_tv_value(value: ShutterSpeedLike) -> _ParseResult:
 
 def _parse_iso_value(value: ISOSpeedLike) -> _ParseResult:
     if isinstance(value, ISOSpeed):
-        return ("entry", value, str(value))
+        return ("entry", value, value.display)
     if isinstance(value, bool):
         raise ValueError(f"Cannot parse ISO value {value!r}")
     if isinstance(value, int):
         if value == 0:
-            return ("entry", _ISO_AUTO, str(_ISO_AUTO))
-        return ("numeric", _iso_ev(value), f"ISO {value}")
+            return ("entry", _ISO_AUTO, "Auto")
+        return ("numeric", _iso_ev(value), f"{value}")
     if isinstance(value, float):
         if value.is_integer():
             return _parse_iso_value(int(value))
@@ -330,7 +330,7 @@ def _parse_iso_value(value: ISOSpeedLike) -> _ParseResult:
     if isinstance(value, str):
         text = value.strip().lower()
         if text in ("auto", "isoauto"):
-            return ("entry", _ISO_AUTO, str(_ISO_AUTO))
+            return ("entry", _ISO_AUTO, "Auto")
         if text.startswith("iso"):
             text = text[3:].strip()
         if text.isdigit():
@@ -442,6 +442,10 @@ def resolve_av(
         nearest: Snap to the nearest supported value (EV distance) instead of
             raising when *value* is unsupported.
 
+            Note: Numeric input within 0.25 EV of a table entry is treated
+            as that entry even when ``nearest=False``. ISO matching (see
+            :func:`resolve_iso`) requires an exact value.
+
     Raises:
         ValueError: Unparseable input, or unsupported value with ``nearest=False``.
     """
@@ -462,7 +466,11 @@ def resolve_tv(
     *,
     nearest: bool = False,
 ) -> ShutterSpeed:
-    """Resolve *value* to a :class:`ShutterSpeed`. See :func:`resolve_av`."""
+    """Resolve *value* to a :class:`ShutterSpeed`. See :func:`resolve_av`.
+
+    Note: Numeric input within 0.25 EV of a table entry is treated as that
+    entry even when ``nearest=False``.
+    """
     return _resolve(
         "Tv",
         SHUTTER_SPEEDS,

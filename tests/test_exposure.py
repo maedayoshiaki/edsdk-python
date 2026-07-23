@@ -208,6 +208,25 @@ class TestResolve:
     def test_out_of_table_nearest(self):
         assert resolve_av(100.0, AV_M6, nearest=True).code == 0x50  # f/22
 
+    def test_non_intersecting_supported_falls_back_to_table(self):
+        # Descriptor returning only codes missing from our table -> full-table matching
+        assert resolve_av(5.6, [0x999]).code == 0x30
+
+    def test_tv_error_message_contents(self):
+        with pytest.raises(ValueError) as excinfo:
+            resolve_tv(1 / 8000, [0x60, 0x68])  # only 1/30 and 1/60 supported
+        message = str(excinfo.value)
+        assert "Supported range:" in message
+        assert "nearest=True" in message
+
+    def test_iso_error_message_contents(self):
+        with pytest.raises(ValueError) as excinfo:
+            resolve_iso(110, ISO_ALL)
+        message = str(excinfo.value)
+        assert "ISO 110" in message
+        assert "ISO ISO" not in message
+        assert "Nearest supported: ISO 100" in message
+
 
 class TestDensotenCompat:
     """下流 Densoten リポジトリが TOML Config から渡す文字列形式の互換性。"""
