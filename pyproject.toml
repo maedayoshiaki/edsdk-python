@@ -9,7 +9,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "edsdk-python"
-version = "0.1.3"  # Python 3.13 対応追加バージョン
+version = "0.1.6"  # 露出値(Av/Tv/ISO)API追加バージョン
 description = "Python wrapper for Canon EDSDK Library"
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.8"
@@ -56,11 +56,5 @@ packages = { find = { where = ["."], include = ["edsdk*"], exclude = ["examples"
 
 [tool.setuptools.package-data]
 edsdk = ["py.typed", "api.pyi"]
-
-[tool.setuptools.data-files]
-"Lib/site-packages/edsdk" = [
-  "dependencies/EDSDK_64/Dll/EDSDK.dll",
-  "dependencies/EDSDK_64/Dll/EdsImage.dll",
-]
 
 # C++ Extension is defined in setup.py (experimental TOML form removed due to parsing issues)

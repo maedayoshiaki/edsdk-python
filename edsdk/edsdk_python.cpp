@@ -1425,25 +1425,20 @@ static PyObject* PyEds_CreateMemoryStreamFromPointer(PyObject *Py_UNUSED(self), 
     void * bufferPtr = nullptr;
     Py_ssize_t bufferLen = 0;
 
-    std::cout << "PyEds_CreateMemoryStreamFromPointer" << std::endl;
     if (PyMemoryView_Check(pyBufferLike)) {
-        std::cout << "PyMemoryView_Check" << std::endl;
         Py_buffer *pyBuffer = PyMemoryView_GET_BUFFER(pyBufferLike);
         if (pyBuffer->readonly) {
             PyErr_SetString(PyExc_ValueError, "Buffer is read-only");
             return nullptr;
         }
-        std::cout << "PyMemoryView_GET_BUFFER" << std::endl;
         bufferPtr = pyBuffer->buf;
         bufferLen = pyBuffer->len;
     }
     else if (PyBytes_Check(pyBufferLike)) {
-        std::cout << "PyBytes_Check" << std::endl;
         bufferPtr = PyBytes_AS_STRING(pyBufferLike);
         bufferLen = PyBytes_GET_SIZE(pyBufferLike);
     }
     else if (PyByteArray_Check(pyBufferLike)) {
-        std::cout << "PyByteArray_Check" << std::endl;
         bufferPtr = PyByteArray_AS_STRING(pyBufferLike);
         bufferLen = PyByteArray_GET_SIZE(pyBufferLike);
     }
@@ -1451,12 +1446,10 @@ static PyObject* PyEds_CreateMemoryStreamFromPointer(PyObject *Py_UNUSED(self), 
         PyErr_SetString(PyExc_TypeError, "buffer parameter must be a bytes, bytearray, or memoryview");
         return nullptr;
     }
-    std::cout << "Py_buffer" << std::endl;
     EdsStreamRef fileStream;
 
     unsigned long retVal(EdsCreateMemoryStreamFromPointer(
         bufferPtr, bufferLen, &fileStream));
-    std::cout << "EdsCreateMemoryStreamFromPointer" << std::endl;
     PyCheck_EDSERROR(retVal);
 
     PyObject *pyFileStream = PyEdsObject_New(fileStream);

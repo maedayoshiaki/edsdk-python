@@ -22,7 +22,6 @@ from typing import (
 
 # Only imported for type checking to avoid runtime cost if deps not installed
 if TYPE_CHECKING:  # pragma: no cover
-    from PIL import Image
     import numpy as np
 
 
@@ -52,6 +51,17 @@ from edsdk.constants.properties import (
     AFMode,
     EvfAFMode,
 )
+from edsdk.exposure import (
+    Aperture,
+    ApertureLike,
+    ISOSpeed,
+    ISOSpeedLike,
+    ShutterSpeed,
+    ShutterSpeedLike,
+    resolve_av,
+    resolve_iso,
+    resolve_tv,
+)
 
 
 # Public callback / return type aliases (after imports to satisfy linters)
@@ -71,57 +81,41 @@ class RawProcessor(Protocol):
         raw_bytes: Binary data of the RAW file (e.g., CR2, CR3).
 
     Returns:
-        Developed image as PIL.Image.Image (RGB mode recommended).
+        Developed image as numpy.ndarray (RGB; uint8/uint16 等を想定).
 
-    Example using rawpy:
+    Example using rawpy (8bit):
         ```python
         import io
         import rawpy
-        from PIL import Image
+        import numpy as np
 
-        def develop_raw(raw_bytes: bytes) -> Image.Image:
+        def develop_raw(raw_bytes: bytes) -> np.ndarray:
             with rawpy.imread(io.BytesIO(raw_bytes)) as raw:
                 rgb = raw.postprocess(
                     use_camera_wb=True,
                     output_bps=8,
                 )
-            return Image.fromarray(rgb)
-
-        # Usage
-        with CameraController() as cam:
-            images = cam.capture_pil(raw_processor=develop_raw)
+            return rgb  # shape: (H, W, 3), dtype=uint8
         ```
 
-    Example with custom settings:
+    Example using rawpy (16bit):
         ```python
-        class MyRawProcessor:
-            def __init__(self, gamma: float = 2.2):
-                self.gamma = gamma
+        import io
+        import rawpy
+        import numpy as np
 
-            def __call__(self, raw_bytes: bytes) -> Image.Image:
-                import io
-                import rawpy
-                import numpy as np
-                from PIL import Image
-
-                with rawpy.imread(io.BytesIO(raw_bytes)) as raw:
-                    rgb = raw.postprocess(gamma=(1, 1), output_bps=16)
-
-                # Apply custom gamma
-                rgb_float = rgb.astype(np.float32) / 65535.0
-                rgb_gamma = np.power(rgb_float, 1.0 / self.gamma)
-                rgb_8bit = (rgb_gamma * 255).clip(0, 255).astype(np.uint8)
-
-                return Image.fromarray(rgb_8bit)
-
-        # Usage
-        processor = MyRawProcessor(gamma=2.4)
-        images = cam.capture_pil(raw_processor=processor)
+        def develop_raw_16(raw_bytes: bytes) -> np.ndarray:
+            with rawpy.imread(io.BytesIO(raw_bytes)) as raw:
+                rgb = raw.postprocess(
+                    gamma=(1, 1),
+                    output_bps=16,
+                )
+            return rgb  # dtype=uint16
         ```
     """
 
-    def __call__(self, raw_bytes: bytes) -> "Image.Image":
-        """Process RAW bytes and return developed PIL Image."""
+    def __call__(self, raw_bytes: bytes) -> "np.ndarray":
+        """Process RAW bytes and return developed numpy array (RGB)."""
         ...
 
 
@@ -137,7 +131,7 @@ def _validate_raw_processor(processor: object) -> None:
     if not callable(processor):
         raise TypeError(
             "raw_processor must be callable.\n"
-            "Expected signature: (raw_bytes: bytes) -> PIL.Image.Image\n"
+            "Expected signature: (raw_bytes: bytes) -> numpy.ndarray\n"
             "See RawProcessor docstring for implementation examples."
         )
 
@@ -156,7 +150,7 @@ def _validate_raw_processor(processor: object) -> None:
             raise TypeError(
                 f"raw_processor must accept exactly 1 required argument (raw_bytes), "
                 f"but got {len(params)} required argument(s).\n"
-                "Expected signature: (raw_bytes: bytes) -> PIL.Image.Image"
+                "Expected signature: (raw_bytes: bytes) -> numpy.ndarray"
             )
     except (ValueError, TypeError):
         # Some built-in callables don't support signature inspection
@@ -216,145 +210,6 @@ def _save_directory_item(
     edsdk.Download(object_handle, info["size"], out_stream)
     edsdk.DownloadComplete(object_handle)
     return dst
-
-
-def _reverse_lookup(table: Dict[int, str]) -> Dict[str, int]:
-    # Normalize keys to a canonical string for robust matching
-    rev: Dict[str, int] = {}
-    for k, v in table.items():
-        key = str(v).strip().lower()
-        rev[key] = k
-        # For Av allow prefix like f/5.6
-        if (
-            key.replace(" ", "").replace("(1/3)", "")
-            and "/" not in key
-            and "bulb" not in key
-        ):
-            try:
-                fnum = float(key)
-                rev[f"f/{fnum:g}"] = k
-                rev[f"{fnum:g}"] = k
-            except Exception:
-                pass
-        # For Tv allow variants like 0.5s, 1/125s, integers without quotes
-        if any(ch in key for ch in ['"', "/"]) or key.isdigit():
-            cleaned = key.replace('"', "s").replace(" ", "")
-            rev[cleaned] = k
-    return rev
-
-
-_AV_STR_TO_CODE = _reverse_lookup(AvTable)
-_TV_STR_TO_CODE = _reverse_lookup(TvTable)
-
-
-def _parse_av(value: Union[str, float, int]) -> int:
-    if isinstance(value, (int, float)):
-        key = f"{float(value):g}"
-        if key in _AV_STR_TO_CODE:
-            return _AV_STR_TO_CODE[key]
-        key2 = f"f/{float(value):g}"
-        if key2 in _AV_STR_TO_CODE:
-            return _AV_STR_TO_CODE[key2]
-        raise ValueError(f"Unsupported Av value: {value}")
-    key = str(value).strip().lower()
-    key = key.replace("f ", "f/") if key.startswith("f ") else key
-    if key.startswith("f/") and key[2:] in _AV_STR_TO_CODE:
-        return _AV_STR_TO_CODE[key]
-    if key in _AV_STR_TO_CODE:
-        return _AV_STR_TO_CODE[key]
-    # Try removing trailing 'f' or spaces
-    key_alt = key.rstrip("f ")
-    if key_alt in _AV_STR_TO_CODE:
-        return _AV_STR_TO_CODE[key_alt]
-    raise ValueError(f"Unsupported Av value: {value}")
-
-
-def _parse_tv(value: Union[str, float, int]) -> int:
-    # Accept formats: "1/125", 0.5, "0.5", 2 (seconds), "bulb"
-    if isinstance(value, (int, float)):
-        seconds = float(value)
-        # Build candidate keys
-        candidates = [
-            f"{seconds:g}s",
-            f"{int(seconds)}",
-            f"{int(seconds)}s",
-        ]
-        for c in candidates:
-            c = c.lower()
-            if c in _TV_STR_TO_CODE:
-                return _TV_STR_TO_CODE[c]
-        # Try to find nearest by computing numeric seconds of table
-        best: Optional[Tuple[int, float]] = None
-        for code, disp in TvTable.items():
-            try:
-                s = _tv_display_to_seconds(disp)
-            except Exception:
-                continue
-            err = abs(s - seconds)
-            if best is None or err < best[1]:
-                best = (code, err)
-        if best is not None and best[1] < 1e-6:  # exact or very close
-            return best[0]
-        raise ValueError(f"Unsupported Tv value: {value}")
-    key = str(value).strip().lower()
-    if key == "bulb":
-        return _TV_STR_TO_CODE.get("bulb", 0x0C)
-    # Normalize variants like 1/125s, 0.5s, 2s, 2
-    key = key.replace('"', "s")
-    if key.endswith("sec"):
-        key = key[:-3] + "s"
-    if key in _TV_STR_TO_CODE:
-        return _TV_STR_TO_CODE[key]
-    # Remove trailing 's'
-    if key.endswith("s") and key[:-1] in _TV_STR_TO_CODE:
-        return _TV_STR_TO_CODE[key[:-1]]
-    raise ValueError(f"Unsupported Tv value: {value}")
-
-
-def _tv_display_to_seconds(display: str) -> float:
-    import re
-
-    disp = str(display).strip()
-    if disp.lower() == "bulb":
-        raise ValueError("Bulb has no fixed seconds")
-    # Canon style: 0"5 -> 0.5s, 3"2 -> 3.2s, 30" -> 30s
-    if '"' in disp:
-        m = re.fullmatch(r"(\d+)\"(\d)", disp)
-        if m:
-            return float(f"{m.group(1)}.{m.group(2)}")
-        # pure seconds like 30"
-        if disp.endswith('"') and disp[:-1].isdigit():
-            return float(disp[:-1])
-    # Normalize a few patterns
-    d = disp.replace('"', "s")
-    if d.endswith("s"):
-        # 0.5s, 3s, 10s
-        return float(d[:-1])
-    if "/" in d:
-        num, den = d.split("/", 1)
-        return float(num) / float(den)
-    # plain number means seconds
-    return float(d)
-
-
-def _parse_iso(value: Union[str, int]) -> int:
-    if isinstance(value, int):
-        if value == 0:
-            return int(ISOSpeedCamera.ISOAuto)
-        name = f"ISO{value}"
-        if hasattr(ISOSpeedCamera, name):
-            return int(getattr(ISOSpeedCamera, name))
-        raise ValueError(f"Unsupported ISO value: {value}")
-    key = str(value).strip().lower()
-    if key in ("auto", "isoauto"):
-        return int(ISOSpeedCamera.ISOAuto)
-    if key.startswith("iso"):
-        tail = key[3:]
-        if tail.isdigit():
-            return _parse_iso(int(tail))
-    if key.isdigit():
-        return _parse_iso(int(key))
-    raise ValueError(f"Unsupported ISO value: {value}")
 
 
 def _image_quality_includes_raw(quality_code: int) -> bool:
@@ -601,6 +456,7 @@ class CameraController:
         manual_focus: Optional[bool] = None,
         af_mode: Optional[Union[str, int]] = None,
         evf_af_mode: Optional[Union[str, int]] = None,
+        nearest: bool = False,
         validate: bool = True,
         tolerate_not_supported: bool = False,
     ) -> None:
@@ -609,11 +465,14 @@ class CameraController:
         # Prepare desired values
         to_set: List[Tuple[PropID, int]] = []
         if av is not None:
-            to_set.append((PropID.Av, _parse_av(av)))
+            codes = self._get_supported_codes(PropID.Av) if validate else ()
+            to_set.append((PropID.Av, resolve_av(av, codes, nearest=nearest).code))
         if tv is not None:
-            to_set.append((PropID.Tv, _parse_tv(tv)))
+            codes = self._get_supported_codes(PropID.Tv) if validate else ()
+            to_set.append((PropID.Tv, resolve_tv(tv, codes, nearest=nearest).code))
         if iso is not None:
-            to_set.append((PropID.ISOSpeed, _parse_iso(iso)))
+            codes = self._get_supported_codes(PropID.ISOSpeed) if validate else ()
+            to_set.append((PropID.ISOSpeed, resolve_iso(iso, codes, nearest=nearest).code))
         if ae_mode is not None:
             to_set.append((PropID.AEMode, _enum_code(AEMode, ae_mode)))
         if metering is not None:
@@ -640,6 +499,10 @@ class CameraController:
         if validate:
             filtered: List[Tuple[PropID, int]] = []
             for pid, code in to_set:
+                if pid in (PropID.Av, PropID.Tv, PropID.ISOSpeed):
+                    # Already resolved against camera-supported codes by resolve_*
+                    filtered.append((pid, code))
+                    continue
                 supported = self._get_supported_codes(pid)
                 if supported and code not in supported:
                     if tolerate_not_supported and pid in (PropID.AEMode, PropID.AFMode):
@@ -708,6 +571,98 @@ class CameraController:
             ),
         }
         return props
+
+    # ---------- Exposure values (Av / Tv / ISO) ----------
+    def _require_session(self) -> EdsObject:
+        if self._cam is None:
+            raise RuntimeError("Camera session not open")
+        return self._cam
+
+    def get_av(self) -> Aperture:
+        """Return the current aperture as an :class:`Aperture`."""
+        cam = self._require_session()
+        return Aperture.from_code(int(edsdk.GetPropertyData(cam, PropID.Av, 0)))
+
+    def get_tv(self) -> ShutterSpeed:
+        """Return the current shutter speed as a :class:`ShutterSpeed`."""
+        cam = self._require_session()
+        return ShutterSpeed.from_code(int(edsdk.GetPropertyData(cam, PropID.Tv, 0)))
+
+    def get_iso(self) -> ISOSpeed:
+        """Return the current ISO as an :class:`ISOSpeed`."""
+        cam = self._require_session()
+        return ISOSpeed.from_code(
+            int(edsdk.GetPropertyData(cam, PropID.ISOSpeed, 0))
+        )
+
+    def set_av(self, value: ApertureLike, *, nearest: bool = False) -> Aperture:
+        """Set the aperture and return the value the camera reports back.
+
+        Args:
+            value: f-number (5.6), string ("f/5.6", "5.6"), or Aperture.
+            nearest: Snap to the nearest supported value instead of raising.
+        """
+        cam = self._require_session()
+        resolved = resolve_av(
+            value, self._get_supported_codes(PropID.Av), nearest=nearest
+        )
+        self._log(f"Set Av -> {resolved}")
+        edsdk.SetPropertyData(cam, PropID.Av, 0, resolved.code)
+        return self.get_av()
+
+    def set_tv(self, value: ShutterSpeedLike, *, nearest: bool = False) -> ShutterSpeed:
+        """Set the shutter speed and return the value the camera reports back.
+
+        Args:
+            value: seconds (0.008), string ("1/125", "0.5s", "bulb"), or ShutterSpeed.
+            nearest: Snap to the nearest supported value instead of raising.
+        """
+        cam = self._require_session()
+        resolved = resolve_tv(
+            value, self._get_supported_codes(PropID.Tv), nearest=nearest
+        )
+        self._log(f"Set Tv -> {resolved}")
+        edsdk.SetPropertyData(cam, PropID.Tv, 0, resolved.code)
+        return self.get_tv()
+
+    def set_iso(self, value: ISOSpeedLike, *, nearest: bool = False) -> ISOSpeed:
+        """Set the ISO and return the value the camera reports back.
+
+        Args:
+            value: ISO value (400, 0=Auto), string ("400", "auto"), or ISOSpeed.
+            nearest: Snap to the nearest supported value instead of raising.
+        """
+        cam = self._require_session()
+        resolved = resolve_iso(
+            value, self._get_supported_codes(PropID.ISOSpeed), nearest=nearest
+        )
+        self._log(f"Set ISO -> {resolved}")
+        edsdk.SetPropertyData(cam, PropID.ISOSpeed, 0, resolved.code)
+        return self.get_iso()
+
+    def supported_av(self) -> List[Aperture]:
+        """Apertures supported by the connected camera/lens."""
+        self._require_session()
+        return self._supported_entries(PropID.Av, Aperture.from_code)
+
+    def supported_tv(self) -> List[ShutterSpeed]:
+        """Shutter speeds supported by the connected camera."""
+        self._require_session()
+        return self._supported_entries(PropID.Tv, ShutterSpeed.from_code)
+
+    def supported_iso(self) -> List[ISOSpeed]:
+        """ISO speeds supported by the connected camera."""
+        self._require_session()
+        return self._supported_entries(PropID.ISOSpeed, ISOSpeed.from_code)
+
+    def _supported_entries(self, pid: PropID, from_code: Callable[[int], object]) -> List:
+        entries: List = []
+        for code in self._get_supported_codes(pid):
+            try:
+                entries.append(from_code(code))
+            except ValueError:
+                self._log(f"Skip unknown {pid.name} code 0x{code:X}")
+        return entries
 
     # ---------- Profiles ----------
     def save_profile(self, path: str) -> None:
@@ -891,7 +846,7 @@ class CameraController:
                         pass
         return data_list
 
-    def capture_pil(
+    def capture_numpy(
         self,
         shots: int = 1,
         timeout: float = 5.0,
@@ -901,8 +856,10 @@ class CameraController:
         retry_delay: float = 0.3,
         keep_files: bool = False,
         raw_processor: Optional[RawProcessor] = None,
-    ) -> List["Image.Image"]:
-        """Capture and return a list of PIL Images (requires Pillow).
+    ) -> List["np.ndarray"]:
+        """Capture and return a list of numpy arrays (RGB).
+
+        こちらが設計の軸になるメソッドです。
 
         Args:
             shots: Number of shots to capture.
@@ -913,22 +870,33 @@ class CameraController:
             keep_files: If True, keep captured files on disk.
             raw_processor: Callback to develop RAW images.
                            Must conform to RawProcessor protocol:
-                           (raw_bytes: bytes) -> PIL.Image.Image
+                           (raw_bytes: bytes) -> numpy.ndarray
                            Required if camera is set to RAW or RAW+JPEG mode.
                            See RawProcessor docstring for examples.
 
         Returns:
-            List of PIL Image objects.
+            List of numpy arrays (RGB format, dtype 任意).
 
         Raises:
             ValueError: If RAW capture is enabled but no raw_processor provided.
-            TypeError: If raw_processor has invalid signature.
-            RuntimeError: If Pillow is not installed or camera session not open.
+            TypeError: If raw_processor has invalid signature or returns non-ndarray.
+            RuntimeError: If numpy is not installed or camera session not open.
         """
         try:
-            from PIL import Image  # type: ignore
+            import numpy as np  # type: ignore
         except Exception as e:
-            raise RuntimeError("Pillow (PIL) is required for capture_pil()") from e
+            raise RuntimeError("numpy is required for capture_numpy()") from e
+
+        # JPEG/HEIF デコード用の代替ライブラリ（imageio.v3）を準備
+        try:
+            import imageio.v3 as iio  # type: ignore
+        except Exception as e:
+            # RAW のみを raw_processor で処理するモードなら許容し、
+            # JPEG/HEIF を含む場合に備えて明示的なエラーメッセージを出す
+            iio = None  # type: ignore[assignment]
+            imageio_import_error = e
+        else:
+            imageio_import_error = None
 
         # Check current ImageQuality setting before capture
         if self._cam is None:
@@ -964,25 +932,24 @@ class CameraController:
             retry_delay=retry_delay,
         )
 
-        images: List["Image.Image"] = []
+        arrays: List["np.ndarray"] = []
         for p in paths:
             try:
                 with open(p, "rb") as f:
                     raw_bytes = f.read()
 
-                # Determine if this specific file is RAW by extension
                 if _is_raw_file(p):
                     # RAW file: use processor
                     if raw_processor is not None:
                         self._log(
                             f"Processing RAW file with raw_processor: {os.path.basename(p)}"
                         )
-                        img = raw_processor(raw_bytes)
+                        arr = raw_processor(raw_bytes)
                         # Validate return type
-                        if not isinstance(img, Image.Image):
+                        if not isinstance(arr, np.ndarray):
                             raise TypeError(
-                                f"raw_processor must return PIL.Image.Image, "
-                                f"but got {type(img).__name__}.\n"
+                                f"raw_processor must return numpy.ndarray, "
+                                f"but got {type(arr).__name__}.\n"
                                 "See RawProcessor docstring for correct implementation."
                             )
                     else:
@@ -992,14 +959,20 @@ class CameraController:
                             "but no raw_processor provided."
                         )
                 else:
-                    # JPEG/HEIF: let Pillow handle it
-                    self._log(f"Loading image with Pillow: {os.path.basename(p)}")
-                    img = Image.open(io.BytesIO(raw_bytes))
-                    img.load()  # fully load to detach from BytesIO
+                    # JPEG/HEIF: decode via imageio instead of Pillow
+                    if iio is None:
+                        raise RuntimeError(
+                            "imageio (imageio.v3) is required to decode JPEG/HEIF "
+                            "for capture_numpy(). Install via 'pip install imageio'."
+                        ) from imageio_import_error
+                    self._log(
+                        f"Loading image with imageio -> numpy: {os.path.basename(p)}"
+                    )
+                    # imageio.v3.imread は bytes も扱える
+                    arr = iio.imread(raw_bytes)
 
-                images.append(img)
+                arrays.append(arr)
             except Exception as e:
-                # Re-raise with more context
                 if _is_raw_file(p) and raw_processor is None:
                     raise RuntimeError(
                         f"Failed to process {os.path.basename(p)}. "
@@ -1013,56 +986,7 @@ class CameraController:
                     except Exception:
                         pass
 
-        return images
-
-    def capture_numpy(
-        self,
-        shots: int = 1,
-        timeout: float = 5.0,
-        *,
-        interval: float = 0.0,
-        retry: int = 0,
-        retry_delay: float = 0.3,
-        keep_files: bool = False,
-        raw_processor: Optional[RawProcessor] = None,
-    ) -> List["np.ndarray"]:
-        """Capture and return a list of numpy arrays (requires numpy).
-
-        Args:
-            shots: Number of shots to capture.
-            timeout: Timeout in seconds for each shot transfer.
-            interval: Interval in seconds between shots.
-            retry: Number of retries on timeout.
-            retry_delay: Delay in seconds between retries.
-            keep_files: If True, keep captured files on disk.
-            raw_processor: Callback to develop RAW images.
-                           Must conform to RawProcessor protocol:
-                           (raw_bytes: bytes) -> PIL.Image.Image
-                           Required if camera is set to RAW or RAW+JPEG mode.
-                           See RawProcessor docstring for examples.
-
-        Returns:
-            List of numpy arrays (RGB format).
-
-        Raises:
-            ValueError: If RAW capture is enabled but no raw_processor provided.
-            TypeError: If raw_processor has invalid signature.
-            RuntimeError: If numpy is not installed or camera session not open.
-        """
-        try:
-            import numpy as np  # type: ignore
-        except Exception as e:
-            raise RuntimeError("numpy is required for capture_numpy()") from e
-        pil_images = self.capture_pil(
-            shots=shots,
-            timeout=timeout,
-            interval=interval,
-            retry=retry,
-            retry_delay=retry_delay,
-            keep_files=keep_files,
-            raw_processor=raw_processor,
-        )
-        return [np.array(im) for im in pil_images]
+        return arrays
 
     # ---------- Live View ----------
     def start_live_view(self) -> None:
@@ -1116,23 +1040,55 @@ class CameraController:
                         f"Live view saved: {save_path} (attempt {attempt}/{MAX_ATTEMPTS})"
                     )
                     return save_path
-                # Fallback: save to temp file and read bytes
-                tmp_path = os.path.join(self.save_dir, f"evf_{uuid.uuid4().hex}.jpg")
-                out_stream = edsdk.CreateFileStream(
-                    tmp_path, FileCreateDisposition.CreateAlways, Access.ReadWrite
-                )
-                evf_image = edsdk.CreateEvfImageRef(out_stream)
-                edsdk.DownloadEvfImage(self._cam, evf_image)
-                with open(tmp_path, "rb") as f:
-                    data = f.read()
-                try:
-                    os.remove(tmp_path)
-                except Exception:
-                    pass
-                self._log(
-                    f"Live view grabbed: {len(data)} bytes (attempt {attempt}/{MAX_ATTEMPTS})"
-                )
-                return data
+                # Default: download EVF frame into a pre-allocated in-memory buffer.
+                # This avoids creating any temporary files on disk.
+                buf_size = 8 * 1024 * 1024  # 8 MiB initial buffer
+                max_buf_size = 64 * 1024 * 1024  # 64 MiB cap
+                last_buf_exc: Optional[Exception] = None
+
+                while buf_size <= max_buf_size:
+                    try:
+                        buf = bytearray(buf_size)
+                        out_stream = edsdk.CreateMemoryStreamFromPointer(buf)
+                        evf_image = edsdk.CreateEvfImageRef(out_stream)
+                        edsdk.DownloadEvfImage(self._cam, evf_image)
+
+                        # Prefer position (bytes written). Fallback to length.
+                        n = int(edsdk.GetPosition(out_stream))
+                        if n <= 0:
+                            n = int(edsdk.GetLength(out_stream))
+                        if n <= 0:
+                            raise RuntimeError(
+                                "Live view download returned empty buffer"
+                            )
+                        if n > len(buf):
+                            raise RuntimeError(
+                                f"Live view wrote {n} bytes into a {len(buf)} byte buffer"
+                            )
+
+                        data = bytes(memoryview(buf)[:n])
+                        self._log(
+                            f"Live view grabbed: {len(data)} bytes (attempt {attempt}/{MAX_ATTEMPTS})"
+                        )
+                        return data
+                    except Exception as e:
+                        # If buffer is too small, retry with a larger one.
+                        last_buf_exc = e
+                        msg = str(e)
+                        code = getattr(e, "code", None)
+                        might_be_too_small = (
+                            (code == 0x00000065)  # EDS_ERR_MEM_ALLOC_FAILED (common)
+                            or ("BUFFER" in msg.upper())
+                            or ("MEM" in msg.upper() and "ALLOC" in msg.upper())
+                        )
+                        if not might_be_too_small:
+                            raise
+                        buf_size *= 2
+                        continue
+
+                if last_buf_exc is not None:
+                    raise last_buf_exc
+                raise RuntimeError("Live view download failed without exception")
             except Exception as e:  # Catch SDK error
                 code = getattr(e, "code", None)
                 msg = str(e)
@@ -1156,32 +1112,32 @@ class CameraController:
             raise last_exc
         raise RuntimeError("Unexpected live view failure without exception")
 
-    def grab_live_view_pil(self) -> "Image.Image":
-        """Grab one live-view frame and return as PIL Image (requires Pillow)."""
-        try:
-            from PIL import Image  # type: ignore
-        except Exception as e:
-            raise RuntimeError(
-                "Pillow (PIL) is required for grab_live_view_pil()"
-            ) from e
-        data = self.grab_live_view_frame()
-        if isinstance(data, str):
-            with open(data, "rb") as f:
-                raw = f.read()
-            img = Image.open(io.BytesIO(raw))
-        else:
-            img = Image.open(io.BytesIO(data))
-        img.load()
-        return img
-
     def grab_live_view_numpy(self) -> "np.ndarray":
-        """Grab one live-view frame and return as numpy array (requires numpy)."""
+        """Grab one live-view frame and return as numpy array (requires numpy and imageio)."""
         try:
             import numpy as np  # type: ignore
         except Exception as e:
             raise RuntimeError("numpy is required for grab_live_view_numpy()") from e
-        pil_img = self.grab_live_view_pil()
-        return np.array(pil_img)
+
+        try:
+            import imageio.v3 as iio  # type: ignore
+        except Exception as e:
+            raise RuntimeError(
+                "imageio (imageio.v3) is required for grab_live_view_numpy(). "
+                "Install via 'pip install imageio'."
+            ) from e
+
+        data = self.grab_live_view_frame()
+        if isinstance(data, str):
+            # ファイルパスが返ってきた場合はファイルから読む
+            with open(data, "rb") as f:
+                raw = f.read()
+        else:
+            raw = data
+
+        # imageio で bytes から直接 numpy 配列へ
+        arr = iio.imread(raw)
+        return arr
 
     # ---------- asyncio event queue ----------
     def enable_async(
