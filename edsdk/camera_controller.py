@@ -51,6 +51,17 @@ from edsdk.constants.properties import (
     AFMode,
     EvfAFMode,
 )
+from edsdk.exposure import (
+    Aperture,
+    ApertureLike,
+    ISOSpeed,
+    ISOSpeedLike,
+    ShutterSpeed,
+    ShutterSpeedLike,
+    resolve_av,
+    resolve_iso,
+    resolve_tv,
+)
 
 
 # Public callback / return type aliases (after imports to satisfy linters)
@@ -199,145 +210,6 @@ def _save_directory_item(
     edsdk.Download(object_handle, info["size"], out_stream)
     edsdk.DownloadComplete(object_handle)
     return dst
-
-
-def _reverse_lookup(table: Dict[int, str]) -> Dict[str, int]:
-    # Normalize keys to a canonical string for robust matching
-    rev: Dict[str, int] = {}
-    for k, v in table.items():
-        key = str(v).strip().lower()
-        rev[key] = k
-        # For Av allow prefix like f/5.6
-        if (
-            key.replace(" ", "").replace("(1/3)", "")
-            and "/" not in key
-            and "bulb" not in key
-        ):
-            try:
-                fnum = float(key)
-                rev[f"f/{fnum:g}"] = k
-                rev[f"{fnum:g}"] = k
-            except Exception:
-                pass
-        # For Tv allow variants like 0.5s, 1/125s, integers without quotes
-        if any(ch in key for ch in ['"', "/"]) or key.isdigit():
-            cleaned = key.replace('"', "s").replace(" ", "")
-            rev[cleaned] = k
-    return rev
-
-
-_AV_STR_TO_CODE = _reverse_lookup(AvTable)
-_TV_STR_TO_CODE = _reverse_lookup(TvTable)
-
-
-def _parse_av(value: Union[str, float, int]) -> int:
-    if isinstance(value, (int, float)):
-        key = f"{float(value):g}"
-        if key in _AV_STR_TO_CODE:
-            return _AV_STR_TO_CODE[key]
-        key2 = f"f/{float(value):g}"
-        if key2 in _AV_STR_TO_CODE:
-            return _AV_STR_TO_CODE[key2]
-        raise ValueError(f"Unsupported Av value: {value}")
-    key = str(value).strip().lower()
-    key = key.replace("f ", "f/") if key.startswith("f ") else key
-    if key.startswith("f/") and key[2:] in _AV_STR_TO_CODE:
-        return _AV_STR_TO_CODE[key]
-    if key in _AV_STR_TO_CODE:
-        return _AV_STR_TO_CODE[key]
-    # Try removing trailing 'f' or spaces
-    key_alt = key.rstrip("f ")
-    if key_alt in _AV_STR_TO_CODE:
-        return _AV_STR_TO_CODE[key_alt]
-    raise ValueError(f"Unsupported Av value: {value}")
-
-
-def _parse_tv(value: Union[str, float, int]) -> int:
-    # Accept formats: "1/125", 0.5, "0.5", 2 (seconds), "bulb"
-    if isinstance(value, (int, float)):
-        seconds = float(value)
-        # Build candidate keys
-        candidates = [
-            f"{seconds:g}s",
-            f"{int(seconds)}",
-            f"{int(seconds)}s",
-        ]
-        for c in candidates:
-            c = c.lower()
-            if c in _TV_STR_TO_CODE:
-                return _TV_STR_TO_CODE[c]
-        # Try to find nearest by computing numeric seconds of table
-        best: Optional[Tuple[int, float]] = None
-        for code, disp in TvTable.items():
-            try:
-                s = _tv_display_to_seconds(disp)
-            except Exception:
-                continue
-            err = abs(s - seconds)
-            if best is None or err < best[1]:
-                best = (code, err)
-        if best is not None and best[1] < 1e-6:  # exact or very close
-            return best[0]
-        raise ValueError(f"Unsupported Tv value: {value}")
-    key = str(value).strip().lower()
-    if key == "bulb":
-        return _TV_STR_TO_CODE.get("bulb", 0x0C)
-    # Normalize variants like 1/125s, 0.5s, 2s, 2
-    key = key.replace('"', "s")
-    if key.endswith("sec"):
-        key = key[:-3] + "s"
-    if key in _TV_STR_TO_CODE:
-        return _TV_STR_TO_CODE[key]
-    # Remove trailing 's'
-    if key.endswith("s") and key[:-1] in _TV_STR_TO_CODE:
-        return _TV_STR_TO_CODE[key[:-1]]
-    raise ValueError(f"Unsupported Tv value: {value}")
-
-
-def _tv_display_to_seconds(display: str) -> float:
-    import re
-
-    disp = str(display).strip()
-    if disp.lower() == "bulb":
-        raise ValueError("Bulb has no fixed seconds")
-    # Canon style: 0"5 -> 0.5s, 3"2 -> 3.2s, 30" -> 30s
-    if '"' in disp:
-        m = re.fullmatch(r"(\d+)\"(\d)", disp)
-        if m:
-            return float(f"{m.group(1)}.{m.group(2)}")
-        # pure seconds like 30"
-        if disp.endswith('"') and disp[:-1].isdigit():
-            return float(disp[:-1])
-    # Normalize a few patterns
-    d = disp.replace('"', "s")
-    if d.endswith("s"):
-        # 0.5s, 3s, 10s
-        return float(d[:-1])
-    if "/" in d:
-        num, den = d.split("/", 1)
-        return float(num) / float(den)
-    # plain number means seconds
-    return float(d)
-
-
-def _parse_iso(value: Union[str, int]) -> int:
-    if isinstance(value, int):
-        if value == 0:
-            return int(ISOSpeedCamera.ISOAuto)
-        name = f"ISO{value}"
-        if hasattr(ISOSpeedCamera, name):
-            return int(getattr(ISOSpeedCamera, name))
-        raise ValueError(f"Unsupported ISO value: {value}")
-    key = str(value).strip().lower()
-    if key in ("auto", "isoauto"):
-        return int(ISOSpeedCamera.ISOAuto)
-    if key.startswith("iso"):
-        tail = key[3:]
-        if tail.isdigit():
-            return _parse_iso(int(tail))
-    if key.isdigit():
-        return _parse_iso(int(key))
-    raise ValueError(f"Unsupported ISO value: {value}")
 
 
 def _image_quality_includes_raw(quality_code: int) -> bool:
@@ -584,6 +456,7 @@ class CameraController:
         manual_focus: Optional[bool] = None,
         af_mode: Optional[Union[str, int]] = None,
         evf_af_mode: Optional[Union[str, int]] = None,
+        nearest: bool = False,
         validate: bool = True,
         tolerate_not_supported: bool = False,
     ) -> None:
@@ -592,11 +465,14 @@ class CameraController:
         # Prepare desired values
         to_set: List[Tuple[PropID, int]] = []
         if av is not None:
-            to_set.append((PropID.Av, _parse_av(av)))
+            codes = self._get_supported_codes(PropID.Av) if validate else ()
+            to_set.append((PropID.Av, resolve_av(av, codes, nearest=nearest).code))
         if tv is not None:
-            to_set.append((PropID.Tv, _parse_tv(tv)))
+            codes = self._get_supported_codes(PropID.Tv) if validate else ()
+            to_set.append((PropID.Tv, resolve_tv(tv, codes, nearest=nearest).code))
         if iso is not None:
-            to_set.append((PropID.ISOSpeed, _parse_iso(iso)))
+            codes = self._get_supported_codes(PropID.ISOSpeed) if validate else ()
+            to_set.append((PropID.ISOSpeed, resolve_iso(iso, codes, nearest=nearest).code))
         if ae_mode is not None:
             to_set.append((PropID.AEMode, _enum_code(AEMode, ae_mode)))
         if metering is not None:
@@ -623,6 +499,10 @@ class CameraController:
         if validate:
             filtered: List[Tuple[PropID, int]] = []
             for pid, code in to_set:
+                if pid in (PropID.Av, PropID.Tv, PropID.ISOSpeed):
+                    # Already resolved against camera-supported codes by resolve_*
+                    filtered.append((pid, code))
+                    continue
                 supported = self._get_supported_codes(pid)
                 if supported and code not in supported:
                     if tolerate_not_supported and pid in (PropID.AEMode, PropID.AFMode):
@@ -691,6 +571,98 @@ class CameraController:
             ),
         }
         return props
+
+    # ---------- Exposure values (Av / Tv / ISO) ----------
+    def _require_session(self) -> EdsObject:
+        if self._cam is None:
+            raise RuntimeError("Camera session not open")
+        return self._cam
+
+    def get_av(self) -> Aperture:
+        """Return the current aperture as an :class:`Aperture`."""
+        cam = self._require_session()
+        return Aperture.from_code(int(edsdk.GetPropertyData(cam, PropID.Av, 0)))
+
+    def get_tv(self) -> ShutterSpeed:
+        """Return the current shutter speed as a :class:`ShutterSpeed`."""
+        cam = self._require_session()
+        return ShutterSpeed.from_code(int(edsdk.GetPropertyData(cam, PropID.Tv, 0)))
+
+    def get_iso(self) -> ISOSpeed:
+        """Return the current ISO as an :class:`ISOSpeed`."""
+        cam = self._require_session()
+        return ISOSpeed.from_code(
+            int(edsdk.GetPropertyData(cam, PropID.ISOSpeed, 0))
+        )
+
+    def set_av(self, value: ApertureLike, *, nearest: bool = False) -> Aperture:
+        """Set the aperture and return the value the camera reports back.
+
+        Args:
+            value: f-number (5.6), string ("f/5.6", "5.6"), or Aperture.
+            nearest: Snap to the nearest supported value instead of raising.
+        """
+        cam = self._require_session()
+        resolved = resolve_av(
+            value, self._get_supported_codes(PropID.Av), nearest=nearest
+        )
+        self._log(f"Set Av -> {resolved}")
+        edsdk.SetPropertyData(cam, PropID.Av, 0, resolved.code)
+        return self.get_av()
+
+    def set_tv(self, value: ShutterSpeedLike, *, nearest: bool = False) -> ShutterSpeed:
+        """Set the shutter speed and return the value the camera reports back.
+
+        Args:
+            value: seconds (0.008), string ("1/125", "0.5s", "bulb"), or ShutterSpeed.
+            nearest: Snap to the nearest supported value instead of raising.
+        """
+        cam = self._require_session()
+        resolved = resolve_tv(
+            value, self._get_supported_codes(PropID.Tv), nearest=nearest
+        )
+        self._log(f"Set Tv -> {resolved}")
+        edsdk.SetPropertyData(cam, PropID.Tv, 0, resolved.code)
+        return self.get_tv()
+
+    def set_iso(self, value: ISOSpeedLike, *, nearest: bool = False) -> ISOSpeed:
+        """Set the ISO and return the value the camera reports back.
+
+        Args:
+            value: ISO value (400, 0=Auto), string ("400", "auto"), or ISOSpeed.
+            nearest: Snap to the nearest supported value instead of raising.
+        """
+        cam = self._require_session()
+        resolved = resolve_iso(
+            value, self._get_supported_codes(PropID.ISOSpeed), nearest=nearest
+        )
+        self._log(f"Set ISO -> {resolved}")
+        edsdk.SetPropertyData(cam, PropID.ISOSpeed, 0, resolved.code)
+        return self.get_iso()
+
+    def supported_av(self) -> List[Aperture]:
+        """Apertures supported by the connected camera/lens."""
+        self._require_session()
+        return self._supported_entries(PropID.Av, Aperture.from_code)
+
+    def supported_tv(self) -> List[ShutterSpeed]:
+        """Shutter speeds supported by the connected camera."""
+        self._require_session()
+        return self._supported_entries(PropID.Tv, ShutterSpeed.from_code)
+
+    def supported_iso(self) -> List[ISOSpeed]:
+        """ISO speeds supported by the connected camera."""
+        self._require_session()
+        return self._supported_entries(PropID.ISOSpeed, ISOSpeed.from_code)
+
+    def _supported_entries(self, pid: PropID, from_code: Callable[[int], object]) -> List:
+        entries: List = []
+        for code in self._get_supported_codes(pid):
+            try:
+                entries.append(from_code(code))
+            except ValueError:
+                self._log(f"Skip unknown {pid.name} code 0x{code:X}")
+        return entries
 
     # ---------- Profiles ----------
     def save_profile(self, path: str) -> None:
