@@ -5,9 +5,11 @@
 #include "edsdk_utils.h"
 
 #include <cassert>
+#include <cmath>
 #include <cstring>
 #include <iostream>
-#include <map>
+#include <limits>
+#include <memory>
 
 
 typedef struct {
@@ -54,6 +56,134 @@ static PyObject *pyCameraAddedCallback[2] = {nullptr, nullptr};
 static PyObject *pySetPropertyCallback[2] = {nullptr, nullptr};
 static PyObject *pySetObjectCallback[2] = {nullptr, nullptr};
 static PyObject *pySetCameraStateCallback[2] = {nullptr, nullptr};
+
+
+struct PyObjectDeleter {
+    void operator()(PyObject *object) const
+    {
+        Py_XDECREF(object);
+    }
+};
+
+
+using OwnedPyObject = std::unique_ptr<PyObject, PyObjectDeleter>;
+
+
+static bool SetOwnedDictItem(
+        PyObject *dictionary,
+        const char *key,
+        PyObject *value)
+{
+    OwnedPyObject ownedValue(value);
+    return ownedValue &&
+        PyDict_SetItemString(dictionary, key, ownedValue.get()) == 0;
+}
+
+
+template<typename T>
+static bool ReadPropertyValue(
+        const uint8_t *propertyData,
+        const unsigned long dataSize,
+        const unsigned long propertyID,
+        T &value)
+{
+    if (dataSize < sizeof(T)) {
+        PyErr_Format(
+            PyExc_ValueError,
+            "Property %lu returned %lu bytes; expected at least %llu",
+            propertyID,
+            dataSize,
+            static_cast<unsigned long long>(sizeof(T)));
+        return false;
+    }
+    std::memcpy(&value, propertyData, sizeof(T));
+    return true;
+}
+
+
+template<typename T>
+static bool WritePropertyValue(
+        uint8_t *propertyData,
+        const unsigned long dataSize,
+        const unsigned long propertyID,
+        const T value)
+{
+    if (dataSize < sizeof(T)) {
+        PyErr_Format(
+            PyExc_ValueError,
+            "Property %lu provides %lu bytes; expected at least %llu",
+            propertyID,
+            dataSize,
+            static_cast<unsigned long long>(sizeof(T)));
+        return false;
+    }
+    std::memcpy(propertyData, &value, sizeof(T));
+    return true;
+}
+
+
+template<typename T>
+static bool PyLongToUnsignedProperty(
+        PyObject *pyValue,
+        const unsigned long propertyID,
+        T &value)
+{
+    if (!PyLong_Check(pyValue)) {
+        PyErr_Format(
+            PyExc_TypeError,
+            "Property %lu expects an unsigned integer",
+            propertyID);
+        return false;
+    }
+    const unsigned long long converted = PyLong_AsUnsignedLongLong(pyValue);
+    if (PyErr_Occurred()) {
+        return false;
+    }
+    if (converted >
+            static_cast<unsigned long long>((std::numeric_limits<T>::max)())) {
+        PyErr_Format(
+            PyExc_OverflowError,
+            "Value for property %lu is outside its unsigned %llu-bit range",
+            propertyID,
+            static_cast<unsigned long long>(sizeof(T) * 8));
+        return false;
+    }
+    value = static_cast<T>(converted);
+    return true;
+}
+
+
+template<typename T>
+static bool PyLongToSignedProperty(
+        PyObject *pyValue,
+        const unsigned long propertyID,
+        T &value)
+{
+    if (!PyLong_Check(pyValue)) {
+        PyErr_Format(
+            PyExc_TypeError,
+            "Property %lu expects an integer",
+            propertyID);
+        return false;
+    }
+    const long long converted = PyLong_AsLongLong(pyValue);
+    if (PyErr_Occurred()) {
+        return false;
+    }
+    if (converted <
+            static_cast<long long>((std::numeric_limits<T>::min)()) ||
+            converted >
+            static_cast<long long>((std::numeric_limits<T>::max)())) {
+        PyErr_Format(
+            PyExc_OverflowError,
+            "Value for property %lu is outside its signed %llu-bit range",
+            propertyID,
+            static_cast<unsigned long long>(sizeof(T) * 8));
+        return false;
+    }
+    value = static_cast<T>(converted);
+    return true;
+}
 
 
 static void ClearPythonCallbackReferences()
@@ -367,168 +497,325 @@ static PyObject* PyEds_GetPropertyData(PyObject *Py_UNUSED(self), PyObject *args
     PyCheck_EDSERROR(retVal);
 
     PyObject *pyPropertyData = nullptr;
-    void *propertyData = new (std::nothrow) uint8_t[dataSize];
-    if (propertyData == nullptr) {
+    const std::size_t allocationSize = dataSize == 0 ? 1 : dataSize;
+    std::unique_ptr<uint8_t[]> propertyData(
+        new (std::nothrow) uint8_t[allocationSize]);
+    if (!propertyData) {
         PyErr_NoMemory();
         return nullptr;
     }
-    retVal = EdsGetPropertyData(edsObj->edsObj, propertyID, param, dataSize, propertyData);
+    retVal = EdsGetPropertyData(
+        edsObj->edsObj, propertyID, param, dataSize, propertyData.get());
     PyCheck_EDSERROR(retVal);
+
+    const auto pyUnsignedProperty = [propertyID](const unsigned long long value) {
+        if (propertyID == kEdsPropID_BatteryQuality) {
+            PyObject *pyBatteryQuality = GetEnum(
+                "edsdk.constants",
+                "BatteryQuality",
+                static_cast<EdsUInt32>(value));
+            if (pyBatteryQuality != nullptr) {
+                return pyBatteryQuality;
+            }
+            PyErr_Clear();
+            std::cout << "Unknown Battery Quality: " << value << std::endl;
+        }
+        return PyLong_FromUnsignedLongLong(value);
+    };
+
     switch (dataType){
         case kEdsDataType_Bool: {
-            pyPropertyData = PyBool_FromLong(*static_cast<int *>(propertyData));
+            EdsBool value;
+            if (!ReadPropertyValue(
+                    propertyData.get(), dataSize, propertyID, value)) {
+                return nullptr;
+            }
+            pyPropertyData = PyBool_FromLong(value != 0);
             break;
         }
         case kEdsDataType_String: {
-            pyPropertyData = PyUnicode_DecodeFSDefault(static_cast<char *>(propertyData));
+            const char *stringData =
+                reinterpret_cast<const char *>(propertyData.get());
+            const void *terminator = std::memchr(stringData, '\0', dataSize);
+            const Py_ssize_t stringSize = terminator == nullptr
+                ? static_cast<Py_ssize_t>(dataSize)
+                : static_cast<Py_ssize_t>(
+                    static_cast<const char *>(terminator) - stringData);
+            pyPropertyData =
+                PyUnicode_DecodeFSDefaultAndSize(stringData, stringSize);
             break;
         }
-        case kEdsDataType_UInt8:
-        case kEdsDataType_UInt16:
-        case kEdsDataType_UInt32: {
-            if (propertyID == kEdsPropID_BatteryQuality) {
-                pyPropertyData = GetEnum("edsdk.constants", "BatteryQuality", *static_cast<int *>(propertyData));
-                if (pyPropertyData == nullptr) {
-                    PyErr_Clear();
-                    std::cout << "Unknown Battery Quality: " << *static_cast<int *>(propertyData) << std::endl;
-                    pyPropertyData = PyLong_FromUnsignedLong(*static_cast<unsigned long *>(propertyData));
-                }
-                break;
+        case kEdsDataType_UInt8: {
+            EdsUInt8 value;
+            if (!ReadPropertyValue(
+                    propertyData.get(), dataSize, propertyID, value)) {
+                return nullptr;
             }
-            pyPropertyData = PyLong_FromUnsignedLong(*static_cast<unsigned long*>(propertyData));
+            pyPropertyData = pyUnsignedProperty(value);
+            break;
+        }
+        case kEdsDataType_UInt16: {
+            EdsUInt16 value;
+            if (!ReadPropertyValue(
+                    propertyData.get(), dataSize, propertyID, value)) {
+                return nullptr;
+            }
+            pyPropertyData = pyUnsignedProperty(value);
+            break;
+        }
+        case kEdsDataType_UInt32: {
+            EdsUInt32 value;
+            if (!ReadPropertyValue(
+                    propertyData.get(), dataSize, propertyID, value)) {
+                return nullptr;
+            }
+            pyPropertyData = pyUnsignedProperty(value);
             break;
         }
         case kEdsDataType_UInt64: {
-            pyPropertyData = PyLong_FromUnsignedLongLong(*static_cast<unsigned long long *>(propertyData));
+            EdsUInt64 value;
+            if (!ReadPropertyValue(
+                    propertyData.get(), dataSize, propertyID, value)) {
+                return nullptr;
+            }
+            pyPropertyData =
+                PyLong_FromUnsignedLongLong(static_cast<unsigned long long>(value));
             break;
         }
-        case kEdsDataType_Int8:
-        case kEdsDataType_Int16:
+        case kEdsDataType_Int8: {
+            EdsInt8 value;
+            if (!ReadPropertyValue(
+                    propertyData.get(), dataSize, propertyID, value)) {
+                return nullptr;
+            }
+            pyPropertyData = PyLong_FromLong(value);
+            break;
+        }
+        case kEdsDataType_Int16: {
+            EdsInt16 value;
+            if (!ReadPropertyValue(
+                    propertyData.get(), dataSize, propertyID, value)) {
+                return nullptr;
+            }
+            pyPropertyData = PyLong_FromLong(value);
+            break;
+        }
         case kEdsDataType_Int32: {
-            pyPropertyData = PyLong_FromLong(*static_cast<long*>(propertyData));
+            EdsInt32 value;
+            if (!ReadPropertyValue(
+                    propertyData.get(), dataSize, propertyID, value)) {
+                return nullptr;
+            }
+            pyPropertyData = PyLong_FromLong(value);
             break;
         }
         case kEdsDataType_Int64: {
-            pyPropertyData = PyLong_FromLongLong(*static_cast<long long*>(propertyData));
+            EdsInt64 value;
+            if (!ReadPropertyValue(
+                    propertyData.get(), dataSize, propertyID, value)) {
+                return nullptr;
+            }
+            pyPropertyData =
+                PyLong_FromLongLong(static_cast<long long>(value));
             break;
         }
-        case kEdsDataType_Float:
+        case kEdsDataType_Float: {
+            EdsFloat value;
+            if (!ReadPropertyValue(
+                    propertyData.get(), dataSize, propertyID, value)) {
+                return nullptr;
+            }
+            pyPropertyData = PyFloat_FromDouble(value);
+            break;
+        }
         case kEdsDataType_Double: {
-            pyPropertyData = PyFloat_FromDouble(*static_cast<double*>(propertyData));
+            EdsDouble value;
+            if (!ReadPropertyValue(
+                    propertyData.get(), dataSize, propertyID, value)) {
+                return nullptr;
+            }
+            pyPropertyData = PyFloat_FromDouble(value);
             break;
         }
         case kEdsDataType_Rational: {
-            EdsRational *rational = static_cast<EdsRational *>(propertyData);
+            EdsRational rational;
+            if (!ReadPropertyValue(
+                    propertyData.get(), dataSize, propertyID, rational)) {
+                return nullptr;
+            }
             pyPropertyData = PyTuple_New(2);
-            PyTuple_SetItem(pyPropertyData, 0, PyLong_FromLong(rational->numerator));
-            PyTuple_SetItem(pyPropertyData, 1, PyLong_FromUnsignedLong(rational->denominator));
+            PyTuple_SetItem(
+                pyPropertyData, 0, PyLong_FromLong(rational.numerator));
+            PyTuple_SetItem(
+                pyPropertyData, 1,
+                PyLong_FromUnsignedLong(rational.denominator));
             break;
         }
         case kEdsDataType_Point: {
-            EdsPoint *point = static_cast<EdsPoint *>(propertyData);
+            EdsPoint point;
+            if (!ReadPropertyValue(
+                    propertyData.get(), dataSize, propertyID, point)) {
+                return nullptr;
+            }
             pyPropertyData = PyTuple_New(2);
-            PyTuple_SetItem(pyPropertyData, 0, PyLong_FromLong(point->x));
-            PyTuple_SetItem(pyPropertyData, 1, PyLong_FromLong(point->y));
+            PyTuple_SetItem(pyPropertyData, 0, PyLong_FromLong(point.x));
+            PyTuple_SetItem(pyPropertyData, 1, PyLong_FromLong(point.y));
             break;
         }
         case kEdsDataType_Rect: {
-            EdsRect *rect = static_cast<EdsRect *>(propertyData);
+            EdsRect rect;
+            if (!ReadPropertyValue(
+                    propertyData.get(), dataSize, propertyID, rect)) {
+                return nullptr;
+            }
             pyPropertyData = PyTuple_New(4);
-            PyTuple_SetItem(pyPropertyData, 0, PyLong_FromLong(rect->point.x));
-            PyTuple_SetItem(pyPropertyData, 1, PyLong_FromLong(rect->point.y));
-            PyTuple_SetItem(pyPropertyData, 2, PyLong_FromLong(rect->size.width));
-            PyTuple_SetItem(pyPropertyData, 3, PyLong_FromLong(rect->size.height));
+            PyTuple_SetItem(pyPropertyData, 0, PyLong_FromLong(rect.point.x));
+            PyTuple_SetItem(pyPropertyData, 1, PyLong_FromLong(rect.point.y));
+            PyTuple_SetItem(
+                pyPropertyData, 2, PyLong_FromLong(rect.size.width));
+            PyTuple_SetItem(
+                pyPropertyData, 3, PyLong_FromLong(rect.size.height));
             break;
         }
         case kEdsDataType_Time: {
-            EdsTime *t = static_cast<EdsTime *>(propertyData);
+            EdsTime time;
+            if (!ReadPropertyValue(
+                    propertyData.get(), dataSize, propertyID, time)) {
+                return nullptr;
+            }
             PyDateTime_IMPORT;
             pyPropertyData = PyDateTime_FromDateAndTime(
-                static_cast<int>(t->year),
-                static_cast<int>(t->month),
-                static_cast<int>(t->day),
-                static_cast<int>(t->hour),
-                static_cast<int>(t->minute),
-                static_cast<int>(t->second),
-                static_cast<int>(t->milliseconds));
+                static_cast<int>(time.year),
+                static_cast<int>(time.month),
+                static_cast<int>(time.day),
+                static_cast<int>(time.hour),
+                static_cast<int>(time.minute),
+                static_cast<int>(time.second),
+                static_cast<int>(time.milliseconds));
             break;
         }
         case kEdsDataType_ByteBlock: {
-            pyPropertyData = PyBytes_FromStringAndSize(static_cast<char *>(propertyData), dataSize);
+            pyPropertyData = PyBytes_FromStringAndSize(
+                reinterpret_cast<const char *>(propertyData.get()),
+                dataSize);
             break;
         }
         case kEdsDataType_FocusInfo:{
-            EdsFocusInfo *focusInfo = static_cast<EdsFocusInfo *>(propertyData);
-            pyPropertyData = PyDict_New();
-            PyObject *pyImageRect = PyTuple_New(4);
-            PyTuple_SetItem(pyImageRect, 0, PyLong_FromLong(focusInfo->imageRect.point.x));
-            PyTuple_SetItem(pyImageRect, 1, PyLong_FromLong(focusInfo->imageRect.point.y));
-            PyTuple_SetItem(pyImageRect, 2, PyLong_FromLong(focusInfo->imageRect.size.width));
-            PyTuple_SetItem(pyImageRect, 3, PyLong_FromLong(focusInfo->imageRect.size.height));
-            PyObject *pyFocusPointTuple = PyTuple_New(1053);
-            for (int i = 0; i < 1053; i++) {
-                PyObject *pyFocusPoint = PyDict_New();
-                PyDict_SetItemString(pyFocusPoint, "valid", PyLong_FromUnsignedLong(focusInfo->focusPoint[i].valid));
-                PyDict_SetItemString(pyFocusPoint, "selected", PyLong_FromUnsignedLong(focusInfo->focusPoint[i].selected));
-                PyDict_SetItemString(pyFocusPoint, "justFocus", PyLong_FromUnsignedLong(focusInfo->focusPoint[i].justFocus));
-
-                PyObject *pyRect = PyTuple_New(4);
-                PyTuple_SetItem(pyRect, 0, PyLong_FromLong(focusInfo->focusPoint[i].rect.point.x));
-                PyTuple_SetItem(pyRect, 1, PyLong_FromLong(focusInfo->focusPoint[i].rect.point.y));
-                PyTuple_SetItem(pyRect, 2, PyLong_FromLong(focusInfo->focusPoint[i].rect.size.width));
-                PyTuple_SetItem(pyRect, 3, PyLong_FromLong(focusInfo->focusPoint[i].rect.size.height));
-
-                PyObject *pyReserved = PyLong_FromUnsignedLong(focusInfo->focusPoint[i].reserved);
-                PyDict_SetItemString(pyFocusPoint, "rect", pyRect);
-                PyDict_SetItemString(pyFocusPoint, "reserved", pyReserved);
-
-                PyTuple_SetItem(pyFocusPointTuple, i, pyFocusPoint);
-
-                Py_DECREF(pyRect);
-                Py_DECREF(pyReserved);
+            EdsFocusInfo focusInfo;
+            if (!ReadPropertyValue(
+                    propertyData.get(), dataSize, propertyID, focusInfo)) {
+                return nullptr;
             }
-            PyObject *pyPointNumber = PyLong_FromUnsignedLong(focusInfo->pointNumber);
-            PyObject *pyExecuteMode = PyLong_FromUnsignedLong(focusInfo->executeMode);
-
-            PyDict_SetItemString(pyPropertyData, "imageRect", pyImageRect);
-            PyDict_SetItemString(pyPropertyData, "pointNumber", pyPointNumber);
-            PyDict_SetItemString(pyPropertyData, "focusPoint", pyFocusPointTuple);
-            PyDict_SetItemString(pyPropertyData, "executeMode", pyExecuteMode);
-
-            Py_DECREF(pyImageRect);
-            Py_DECREF(pyPointNumber);
-            Py_DECREF(pyFocusPointTuple);
-            Py_DECREF(pyExecuteMode);
+            OwnedPyObject pyFocusInfo(PyDict_New());
+            OwnedPyObject pyImageRect(Py_BuildValue(
+                "(llll)",
+                static_cast<long>(focusInfo.imageRect.point.x),
+                static_cast<long>(focusInfo.imageRect.point.y),
+                static_cast<long>(focusInfo.imageRect.size.width),
+                static_cast<long>(focusInfo.imageRect.size.height)));
+            OwnedPyObject pyFocusPointTuple(PyTuple_New(1053));
+            if (!pyFocusInfo || !pyImageRect || !pyFocusPointTuple) {
+                return nullptr;
+            }
+            for (int i = 0; i < 1053; i++) {
+                const EdsFocusPoint &focusPoint = focusInfo.focusPoint[i];
+                OwnedPyObject pyFocusPoint(PyDict_New());
+                OwnedPyObject pyRect(Py_BuildValue(
+                    "(llll)",
+                    static_cast<long>(focusPoint.rect.point.x),
+                    static_cast<long>(focusPoint.rect.point.y),
+                    static_cast<long>(focusPoint.rect.size.width),
+                    static_cast<long>(focusPoint.rect.size.height)));
+                if (!pyFocusPoint || !pyRect ||
+                        !SetOwnedDictItem(
+                            pyFocusPoint.get(),
+                            "valid",
+                            PyLong_FromUnsignedLong(focusPoint.valid)) ||
+                        !SetOwnedDictItem(
+                            pyFocusPoint.get(),
+                            "selected",
+                            PyLong_FromUnsignedLong(focusPoint.selected)) ||
+                        !SetOwnedDictItem(
+                            pyFocusPoint.get(),
+                            "justFocus",
+                            PyLong_FromUnsignedLong(focusPoint.justFocus)) ||
+                        PyDict_SetItemString(
+                            pyFocusPoint.get(), "rect", pyRect.get()) != 0 ||
+                        !SetOwnedDictItem(
+                            pyFocusPoint.get(),
+                            "reserved",
+                            PyLong_FromUnsignedLong(focusPoint.reserved))) {
+                    return nullptr;
+                }
+                PyTuple_SET_ITEM(
+                    pyFocusPointTuple.get(), i, pyFocusPoint.release());
+            }
+            if (PyDict_SetItemString(
+                    pyFocusInfo.get(), "imageRect", pyImageRect.get()) != 0 ||
+                    !SetOwnedDictItem(
+                        pyFocusInfo.get(),
+                        "pointNumber",
+                        PyLong_FromUnsignedLong(focusInfo.pointNumber)) ||
+                    PyDict_SetItemString(
+                        pyFocusInfo.get(),
+                        "focusPoint",
+                        pyFocusPointTuple.get()) != 0 ||
+                    !SetOwnedDictItem(
+                        pyFocusInfo.get(),
+                        "executeMode",
+                        PyLong_FromUnsignedLong(focusInfo.executeMode))) {
+                return nullptr;
+            }
+            pyPropertyData = pyFocusInfo.release();
             break;
         }
         case kEdsDataType_PictureStyleDesc:{
-            EdsPictureStyleDesc *pictureStyleDesc = static_cast<EdsPictureStyleDesc *>(propertyData);
-            pyPropertyData = PyDict_New();
-            PyObject *pyContrast = PyLong_FromLong(pictureStyleDesc->contrast);
-            PyDict_SetItemString(pyPropertyData, "contrast", pyContrast);
-            PyObject *pySharpness = PyLong_FromUnsignedLong(pictureStyleDesc->sharpness);
-            PyDict_SetItemString(pyPropertyData, "sharpness", pySharpness);
-            PyObject *pySaturation = PyLong_FromLong(pictureStyleDesc->saturation);
-            PyDict_SetItemString(pyPropertyData, "saturation", pySaturation);
-            PyObject *pyColorTone = PyLong_FromLong(pictureStyleDesc->colorTone);
-            PyDict_SetItemString(pyPropertyData, "colorTone", pyColorTone);
-            PyObject *pyFilterEffect = PyLong_FromUnsignedLong(pictureStyleDesc->filterEffect);
-            PyDict_SetItemString(pyPropertyData, "filterEffect", pyFilterEffect);
-            PyObject *pyToningEffect = PyLong_FromUnsignedLong(pictureStyleDesc->toningEffect);
-            PyDict_SetItemString(pyPropertyData, "toningEffect", pyToningEffect);
-            PyObject *pySharpFineness = PyLong_FromUnsignedLong(pictureStyleDesc->sharpFineness);
-            PyDict_SetItemString(pyPropertyData, "sharpFineness", pySharpFineness);
-            PyObject *pySharpThreshold = PyLong_FromUnsignedLong(pictureStyleDesc->sharpThreshold);
-            PyDict_SetItemString(pyPropertyData, "sharpThreshold", pySharpThreshold);
-
-            Py_DECREF(pyContrast);
-            Py_DECREF(pySharpness);
-            Py_DECREF(pySaturation);
-            Py_DECREF(pyColorTone);
-            Py_DECREF(pyFilterEffect);
-            Py_DECREF(pyToningEffect);
-            Py_DECREF(pySharpFineness);
-            Py_DECREF(pySharpThreshold);
+            EdsPictureStyleDesc pictureStyleDesc;
+            if (!ReadPropertyValue(
+                    propertyData.get(), dataSize, propertyID, pictureStyleDesc)) {
+                return nullptr;
+            }
+            OwnedPyObject pyPictureStyleDesc(PyDict_New());
+            if (!pyPictureStyleDesc ||
+                    !SetOwnedDictItem(
+                        pyPictureStyleDesc.get(),
+                        "contrast",
+                        PyLong_FromLong(pictureStyleDesc.contrast)) ||
+                    !SetOwnedDictItem(
+                        pyPictureStyleDesc.get(),
+                        "sharpness",
+                        PyLong_FromUnsignedLong(pictureStyleDesc.sharpness)) ||
+                    !SetOwnedDictItem(
+                        pyPictureStyleDesc.get(),
+                        "saturation",
+                        PyLong_FromLong(pictureStyleDesc.saturation)) ||
+                    !SetOwnedDictItem(
+                        pyPictureStyleDesc.get(),
+                        "colorTone",
+                        PyLong_FromLong(pictureStyleDesc.colorTone)) ||
+                    !SetOwnedDictItem(
+                        pyPictureStyleDesc.get(),
+                        "filterEffect",
+                        PyLong_FromUnsignedLong(
+                            pictureStyleDesc.filterEffect)) ||
+                    !SetOwnedDictItem(
+                        pyPictureStyleDesc.get(),
+                        "toningEffect",
+                        PyLong_FromUnsignedLong(
+                            pictureStyleDesc.toningEffect)) ||
+                    !SetOwnedDictItem(
+                        pyPictureStyleDesc.get(),
+                        "sharpFineness",
+                        PyLong_FromUnsignedLong(
+                            pictureStyleDesc.sharpFineness)) ||
+                    !SetOwnedDictItem(
+                        pyPictureStyleDesc.get(),
+                        "sharpThreshold",
+                        PyLong_FromUnsignedLong(
+                            pictureStyleDesc.sharpThreshold))) {
+                return nullptr;
+            }
+            pyPropertyData = pyPictureStyleDesc.release();
             break;
         }
         case kEdsDataType_Unknown:
@@ -540,12 +827,21 @@ static PyObject* PyEds_GetPropertyData(PyObject *Py_UNUSED(self), PyObject *args
         case kEdsDataType_UInt16_Array:
         case kEdsDataType_UInt32_Array:
         case kEdsDataType_Rational_Array:{
-            PyErr_Format(PyExc_NotImplementedError, "unable to get the property %ls", propertyID);
-            delete propertyData;
+            PyErr_Format(
+                PyExc_NotImplementedError,
+                "Unable to get property %lu with data type %d",
+                propertyID,
+                static_cast<int>(dataType));
             return nullptr;
         }
+        default:
+            PyErr_Format(
+                PyExc_NotImplementedError,
+                "Unable to get property %lu with unknown data type %d",
+                propertyID,
+                static_cast<int>(dataType));
+            return nullptr;
     }
-    delete propertyData;
     return pyPropertyData;
 }
 
@@ -578,19 +874,34 @@ static PyObject* PyEds_SetPropertyData(PyObject *Py_UNUSED(self), PyObject *args
     unsigned long retVal(EdsGetPropertySize(edsObj->edsObj, propertyID, param, &dataType, &dataSize));
     PyCheck_EDSERROR(retVal);
 
-    uint8_t *propertyData = nullptr;
-    if (EDS::DataTypeSize.count(dataType)){
-        propertyData = new (std::nothrow) uint8_t[EDS::DataTypeSize.at(dataType)];
+    std::unique_ptr<uint8_t[]> propertyData;
+    const auto allocatePropertyData = [&propertyData, &dataSize]() {
+        const std::size_t allocationSize = dataSize == 0 ? 1 : dataSize;
+        propertyData.reset(new (std::nothrow) uint8_t[allocationSize]());
+        if (!propertyData) {
+            PyErr_NoMemory();
+            return false;
+        }
+        return true;
+    };
+    if (!allocatePropertyData()) {
+        return nullptr;
     }
+
     switch (dataType){
         case kEdsDataType_Bool: {
-            if (!PyBool_Check(pyPropertyData))
-            {
-                PyErr_Format(PyExc_TypeError, "Properppty %lu expects boolean", propertyID);
-                delete propertyData;
+            if (!PyBool_Check(pyPropertyData)) {
+                PyErr_Format(
+                    PyExc_TypeError,
+                    "Property %lu expects a boolean",
+                    propertyID);
                 return nullptr;
             }
-            *propertyData = PyObject_IsTrue(pyPropertyData) ? true : false;
+            const EdsBool value = PyObject_IsTrue(pyPropertyData) ? 1 : 0;
+            if (!WritePropertyValue(
+                    propertyData.get(), dataSize, propertyID, value)) {
+                return nullptr;
+            }
             break;
         }
         case kEdsDataType_String: {
@@ -600,135 +911,223 @@ static PyObject* PyEds_SetPropertyData(PyObject *Py_UNUSED(self), PyObject *args
             }
         #if PY_VERSION_HEX >= 0x030C0000
             // Python 3.12+: Use filesystem encoding directly
-            PyObject* pyString = PyUnicode_EncodeFSDefault(pyPropertyData);
+            OwnedPyObject pyString(PyUnicode_EncodeFSDefault(pyPropertyData));
         #else
             // Python 3.11 and earlier
-            PyObject* pyString = PyUnicode_AsEncodedString(pyPropertyData, Py_FileSystemDefaultEncoding, Py_FileSystemDefaultEncodeErrors);
+            OwnedPyObject pyString(PyUnicode_AsEncodedString(
+                pyPropertyData,
+                Py_FileSystemDefaultEncoding,
+                Py_FileSystemDefaultEncodeErrors));
         #endif
             if (!pyString) {
                 return nullptr;
             }
-            propertyData = reinterpret_cast<uint8_t *>(strdup(PyBytes_AsString(pyString)));
-            if (!propertyData) {
-                Py_DECREF(pyString);
+            const Py_ssize_t encodedSize = PyBytes_GET_SIZE(pyString.get());
+            if (encodedSize < 0 ||
+                    static_cast<unsigned long long>(encodedSize) + 1 >
+                    (std::numeric_limits<EdsUInt32>::max)()) {
+                PyErr_Format(
+                    PyExc_OverflowError,
+                    "String for property %lu is too large",
+                    propertyID);
                 return nullptr;
             }
-            Py_DECREF(pyString);
+            dataSize = static_cast<unsigned long>(encodedSize + 1);
+            if (!allocatePropertyData()) {
+                return nullptr;
+            }
+            std::memcpy(
+                propertyData.get(),
+                PyBytes_AS_STRING(pyString.get()),
+                static_cast<std::size_t>(encodedSize));
             break;
         }
-    case kEdsDataType_UInt8:
-    case kEdsDataType_UInt16:
-    case kEdsDataType_UInt32: {
-        if (!PyLong_Check(pyPropertyData)) {
-            PyErr_Format(PyExc_TypeError, "Property %lu expects unsigned int", propertyID);
-            delete propertyData;
-            return nullptr;
-        }
-        unsigned long uLongVal = PyLong_AsUnsignedLong(pyPropertyData);
-        memcpy_s(propertyData, EDS::DataTypeSize.at(dataType), &uLongVal, sizeof(unsigned long));
-        break;
-    }
-    case kEdsDataType_UInt64: {
-        if (!PyLong_Check(pyPropertyData)) {
-            PyErr_Format(PyExc_TypeError, "Property %lu expects unsigned int", propertyID);
-            delete propertyData;
-            return nullptr;
-        }
-        unsigned long long uLongLongVal = PyLong_AsUnsignedLongLong(pyPropertyData);
-        memcpy_s(propertyData, EDS::DataTypeSize.at(dataType), &uLongLongVal, sizeof(unsigned long long));
-        break;
-    }
-    case kEdsDataType_Int8:
-    case kEdsDataType_Int16:
-    case kEdsDataType_Int32: {
-        if (!PyLong_Check(pyPropertyData)) {
-            PyErr_Format(PyExc_TypeError, "Property %lu expects int", propertyID);
-            delete propertyData;
-            return nullptr;
-        }
-        long longVal = PyLong_AsLong(pyPropertyData);
-        memcpy_s(propertyData, EDS::DataTypeSize.at(dataType), &longVal, sizeof(long));
-        break;
-    }
-    case kEdsDataType_Int64: {
-        if (!PyLong_Check(pyPropertyData)) {
-            PyErr_Format(PyExc_TypeError, "Property %lu expects int", propertyID);
-            delete propertyData;
-            return nullptr;
-        }
-        long long longLongVal = PyLong_AsLongLong(pyPropertyData);
-        memcpy_s(propertyData, EDS::DataTypeSize.at(dataType), &longLongVal, sizeof(long long));
-        break;
-    }
-    case kEdsDataType_Float:
-    case kEdsDataType_Double: {
-        if (!PyFloat_Check(pyPropertyData)) {
-            PyErr_Format(PyExc_TypeError, "Property %lu expects float", propertyID);
-            delete propertyData;
-            return nullptr;
-        }
-        double doubleVal = PyFloat_AsDouble(pyPropertyData);
-        memcpy_s(propertyData, EDS::DataTypeSize.at(dataType), &doubleVal, sizeof(double));
-        break;
-    }
-    case kEdsDataType_Rational: {
-        PyObject *iter = PyObject_GetIter(pyPropertyData);
-        bool error = false;
-        EdsRational *rational = reinterpret_cast<EdsRational *>(propertyData);
-        if (iter) {
-            PyObject *item = PyIter_Next(iter);
-            if (!item || !PyLong_Check(item)) {
-                error = true;
+        case kEdsDataType_UInt8: {
+            EdsUInt8 value;
+            if (!PyLongToUnsignedProperty(
+                    pyPropertyData, propertyID, value) ||
+                    !WritePropertyValue(
+                        propertyData.get(), dataSize, propertyID, value)) {
+                return nullptr;
             }
-            else {
-                rational->numerator = PyLong_AsLong(item);
-                Py_DECREF(item);
-                item = PyIter_Next(iter);
-                if (!item || !PyLong_Check(item)) {
-                    error = true;
-                }
-                else {
-                    rational->denominator = PyLong_AsUnsignedLong(item);
-                    Py_DECREF(item);
-                }
-            }
-            Py_DECREF(iter);
-        } else {
-            error = true;
+            break;
         }
-        if (error) {
-            PyErr_Format(PyExc_TypeError, "Property %lu expects a sequence of two ints", propertyID);
-            PyErr_Format(PyExc_TypeError, "Property %lu expects a sequence of two ints", propertyID);
-            delete propertyData;
+        case kEdsDataType_UInt16: {
+            EdsUInt16 value;
+            if (!PyLongToUnsignedProperty(
+                    pyPropertyData, propertyID, value) ||
+                    !WritePropertyValue(
+                        propertyData.get(), dataSize, propertyID, value)) {
+                return nullptr;
+            }
+            break;
+        }
+        case kEdsDataType_UInt32: {
+            EdsUInt32 value;
+            if (!PyLongToUnsignedProperty(
+                    pyPropertyData, propertyID, value) ||
+                    !WritePropertyValue(
+                        propertyData.get(), dataSize, propertyID, value)) {
+                return nullptr;
+            }
+            break;
+        }
+        case kEdsDataType_UInt64: {
+            EdsUInt64 value;
+            if (!PyLongToUnsignedProperty(
+                    pyPropertyData, propertyID, value) ||
+                    !WritePropertyValue(
+                        propertyData.get(), dataSize, propertyID, value)) {
+                return nullptr;
+            }
+            break;
+        }
+        case kEdsDataType_Int8: {
+            EdsInt8 value;
+            if (!PyLongToSignedProperty(
+                    pyPropertyData, propertyID, value) ||
+                    !WritePropertyValue(
+                        propertyData.get(), dataSize, propertyID, value)) {
+                return nullptr;
+            }
+            break;
+        }
+        case kEdsDataType_Int16: {
+            EdsInt16 value;
+            if (!PyLongToSignedProperty(
+                    pyPropertyData, propertyID, value) ||
+                    !WritePropertyValue(
+                        propertyData.get(), dataSize, propertyID, value)) {
+                return nullptr;
+            }
+            break;
+        }
+        case kEdsDataType_Int32: {
+            EdsInt32 value;
+            if (!PyLongToSignedProperty(
+                    pyPropertyData, propertyID, value) ||
+                    !WritePropertyValue(
+                        propertyData.get(), dataSize, propertyID, value)) {
+                return nullptr;
+            }
+            break;
+        }
+        case kEdsDataType_Int64: {
+            EdsInt64 value;
+            if (!PyLongToSignedProperty(
+                    pyPropertyData, propertyID, value) ||
+                    !WritePropertyValue(
+                        propertyData.get(), dataSize, propertyID, value)) {
+                return nullptr;
+            }
+            break;
+        }
+        case kEdsDataType_Float: {
+            if (!PyFloat_Check(pyPropertyData)) {
+                PyErr_Format(
+                    PyExc_TypeError,
+                    "Property %lu expects a float",
+                    propertyID);
+                return nullptr;
+            }
+            const double converted = PyFloat_AsDouble(pyPropertyData);
+            if (PyErr_Occurred()) {
+                return nullptr;
+            }
+            if (std::isfinite(converted) &&
+                    (converted > (std::numeric_limits<EdsFloat>::max)() ||
+                     converted < -(std::numeric_limits<EdsFloat>::max)())) {
+                PyErr_Format(
+                    PyExc_OverflowError,
+                    "Value for property %lu is outside its float range",
+                    propertyID);
+                return nullptr;
+            }
+            const EdsFloat value = static_cast<EdsFloat>(converted);
+            if (!WritePropertyValue(
+                    propertyData.get(), dataSize, propertyID, value)) {
+                return nullptr;
+            }
+            break;
+        }
+        case kEdsDataType_Double: {
+            if (!PyFloat_Check(pyPropertyData)) {
+                PyErr_Format(
+                    PyExc_TypeError,
+                    "Property %lu expects a float",
+                    propertyID);
+                return nullptr;
+            }
+            const EdsDouble value = PyFloat_AsDouble(pyPropertyData);
+            if (PyErr_Occurred() ||
+                    !WritePropertyValue(
+                        propertyData.get(), dataSize, propertyID, value)) {
+                return nullptr;
+            }
+            break;
+        }
+        case kEdsDataType_Rational: {
+            OwnedPyObject sequence(PySequence_Fast(
+                pyPropertyData,
+                "Property value must be a sequence of two integers"));
+            if (!sequence || PySequence_Fast_GET_SIZE(sequence.get()) != 2) {
+                if (sequence) {
+                    PyErr_Format(
+                        PyExc_TypeError,
+                        "Property %lu expects a sequence of two integers",
+                        propertyID);
+                }
+                return nullptr;
+            }
+            PyObject **items = PySequence_Fast_ITEMS(sequence.get());
+            EdsRational value{};
+            if (!PyLongToSignedProperty(
+                    items[0], propertyID, value.numerator) ||
+                    !PyLongToUnsignedProperty(
+                        items[1], propertyID, value.denominator) ||
+                    !WritePropertyValue(
+                        propertyData.get(), dataSize, propertyID, value)) {
+                return nullptr;
+            }
+            break;
+        }
+        case kEdsDataType_Unknown:
+        case kEdsDataType_ByteBlock:
+        case kEdsDataType_Point:
+        case kEdsDataType_Rect:
+        case kEdsDataType_Time:
+        case kEdsDataType_FocusInfo:
+        case kEdsDataType_PictureStyleDesc:
+        case kEdsDataType_Bool_Array:
+        case kEdsDataType_Int8_Array:
+        case kEdsDataType_Int16_Array:
+        case kEdsDataType_Int32_Array:
+        case kEdsDataType_UInt8_Array:
+        case kEdsDataType_UInt16_Array:
+        case kEdsDataType_UInt32_Array:
+        case kEdsDataType_Rational_Array:{
+            PyErr_Format(
+                PyExc_NotImplementedError,
+                "Unable to set property %lu with data type %d",
+                propertyID,
+                static_cast<int>(dataType));
             return nullptr;
         }
-        break;
+        default:
+            PyErr_Format(
+                PyExc_NotImplementedError,
+                "Unable to set property %lu with unknown data type %d",
+                propertyID,
+                static_cast<int>(dataType));
+            return nullptr;
     }
-    case kEdsDataType_Unknown:
-    case kEdsDataType_ByteBlock:
-    case kEdsDataType_Point:
-    case kEdsDataType_Rect:
-    case kEdsDataType_Time:
-    case kEdsDataType_FocusInfo:
-    case kEdsDataType_PictureStyleDesc:
-    case kEdsDataType_Bool_Array:
-    case kEdsDataType_Int8_Array:
-    case kEdsDataType_Int16_Array:
-    case kEdsDataType_Int32_Array:
-    case kEdsDataType_UInt8_Array:
-    case kEdsDataType_UInt16_Array:
-    case kEdsDataType_UInt32_Array:
-    case kEdsDataType_Rational_Array:{
-        PyErr_Format(PyExc_NotImplementedError, "unable to get the property %ls", propertyID);
-        delete propertyData;
-        return nullptr;
-    }
-    }
-    if (propertyData == nullptr) {
-        PyErr_Format(PyExc_MemoryError, "failed to allocate memory");
-        return nullptr;
-    }
-    retVal = EdsSetPropertyData(edsObj->edsObj, propertyID, param, dataSize, propertyData);
+
+    retVal = EdsSetPropertyData(
+        edsObj->edsObj,
+        propertyID,
+        param,
+        dataSize,
+        propertyData.get());
     PyCheck_EDSERROR(retVal);
 
     Py_RETURN_NONE;
@@ -1403,29 +1802,28 @@ static PyObject* PyEds_CreateFileStreamEx(PyObject *Py_UNUSED(self), PyObject *a
     }
 
     Py_ssize_t filenameLen(PyUnicode_GET_LENGTH(pyFilename));
-    wchar_t *filenameEncoded(new (std::nothrow) wchar_t[filenameLen + 1]);
-    if (filenameEncoded == nullptr) {
+    std::unique_ptr<wchar_t[]> filenameEncoded(
+        new (std::nothrow) wchar_t[filenameLen + 1]);
+    if (!filenameEncoded) {
         PyErr_SetString(PyExc_MemoryError, "Could not allocate memory for filename");
         return nullptr;
     }
 
     Py_ssize_t nrBytesCopied(PyUnicode_AsWideChar(
-        pyFilename, filenameEncoded, filenameLen));
+        pyFilename, filenameEncoded.get(), filenameLen));
     filenameEncoded[filenameLen] = L'\0';
     if (nrBytesCopied == -1) {
         PyErr_SetString(PyExc_ValueError, "Could not convert filename to wide character string");
-        delete[] filenameEncoded;
         return nullptr;
     }
 
     EdsStreamRef fileStream;
     unsigned long retVal(EdsCreateFileStreamEx(
-        filenameEncoded,
+        filenameEncoded.get(),
         static_cast<EdsFileCreateDisposition>(createDisposition),
         static_cast<EdsAccess>(desiredAccess),
         &fileStream));
 
-    delete[] filenameEncoded;
     PyCheck_EDSERROR(retVal);
 
     PyObject *pyFileStream = PyEdsObject_New(fileStream);
