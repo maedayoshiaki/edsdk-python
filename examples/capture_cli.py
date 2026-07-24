@@ -28,6 +28,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--retry-delay", type=float, default=0.3, help="Delay between retries seconds"
     )
     p.add_argument(
+        "--retry-on-timeout",
+        action="store_true",
+        help=(
+            "Explicitly allow another shutter command after a transfer timeout; "
+            "this can create duplicate photos"
+        ),
+    )
+    p.add_argument(
         "--timeout", type=float, default=5.0, help="Timeout per shot seconds"
     )
     p.add_argument(
@@ -101,6 +109,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 interval=args.interval,
                 retry=args.retry,
                 retry_delay=args.retry_delay,
+                retry_on_timeout=args.retry_on_timeout,
             )
             for pth in paths:
                 print("Saved:", pth)

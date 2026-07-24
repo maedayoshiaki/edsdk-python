@@ -60,7 +60,12 @@ with CameraController(
     )
 
     # examle1: 撮影して保存、パスを表示
-    paths = cam.capture(shots=1, retry=1, retry_delay=0.3)
+    paths = cam.capture(
+        shots=1,
+        retry=1,
+        retry_delay=0.3,
+        retry_on_timeout=True,
+    )
     for p in paths:
         print("Saved:", p)
 

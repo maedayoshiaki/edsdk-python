@@ -23,6 +23,8 @@ python examples\capture_cli.py --av 5.6 --tv 1/125 --iso 400 --save-dir out --sh
 - `--drive-mode`: ドライブモード（例: `SingleShooting`, `ContinuousShooting`）
 - `--interval`: 連写間隔（秒）
 - `--retry` / `--retry-delay`: タイムアウト時のリトライ回数/間隔
+- `--retry-on-timeout`: タイムアウト後の再撮影を明示的に許可
+  （遅延していた元の転送も到着すると、余分な写真が生成される可能性があります）
 - `--timeout`: 1枚あたりの転送待ちタイムアウト（秒）
 - `--list`: カメラが受け付ける候補値を一覧表示して終了
 - `--live-view-frame`: ライブビュー1フレームをJPEGで保存して終了
@@ -50,7 +52,13 @@ with CameraController(index=0, save_dir="out") as cam:
     print(cam.list_supported())
 
     # 撮影（間隔・リトライ指定）
-    paths = cam.capture(shots=3, interval=0.5, retry=1, retry_delay=0.3)
+    paths = cam.capture(
+        shots=3,
+        interval=0.5,
+        retry=1,
+        retry_delay=0.3,
+        retry_on_timeout=True,
+    )
     print(paths)
 ```
 
@@ -70,7 +78,7 @@ CLI 拡張の例:
 python examples\capture_cli.py --list
 
 # 追加プロパティ設定や間隔・リトライ
-python examples\capture_cli.py --av 5.6 --tv 1/125 --iso 400 --ae-mode Manual --metering Evaluative --shots 3 --interval 0.5 --retry 1
+python examples\capture_cli.py --av 5.6 --tv 1/125 --iso 400 --ae-mode Manual --metering Evaluative --shots 3 --interval 0.5 --retry 1 --retry-on-timeout
 
 # ライブビュー1フレーム保存
 python examples\capture_cli.py --live-view-frame out\evf.jpg

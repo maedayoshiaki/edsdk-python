@@ -5,6 +5,7 @@ import os
 import json
 import io
 import asyncio
+import math
 import time
 import uuid
 import inspect
@@ -240,14 +241,39 @@ def _save_directory_item(
     # sanitize path separators in provided name
     filename = filename.replace("\\", "_").replace("/", "_")
     dst = os.path.join(save_dir, filename)
-    out_stream = edsdk.CreateFileStream(
-        dst,
-        FileCreateDisposition.CreateAlways,
-        Access.ReadWrite,
-    )
-    edsdk.Download(object_handle, info["size"], out_stream)
-    edsdk.DownloadComplete(object_handle)
-    return dst
+    temp_name = f".{filename}.{uuid.uuid4().hex}.part"
+    temp_path = os.path.join(save_dir, temp_name)
+    completed = False
+    out_stream: Optional[EdsObject] = None
+    try:
+        out_stream = edsdk.CreateFileStream(
+            temp_path,
+            FileCreateDisposition.CreateAlways,
+            Access.ReadWrite,
+        )
+        edsdk.Download(object_handle, info["size"], out_stream)
+        edsdk.DownloadComplete(object_handle)
+        completed = True
+
+        # Release the SDK stream before replacing the final path so Windows no
+        # longer holds the temporary file open.
+        out_stream = None
+        os.replace(temp_path, dst)
+        return dst
+    except BaseException:
+        if not completed:
+            try:
+                edsdk.DownloadCancel(object_handle)
+            except BaseException:
+                pass
+        out_stream = None
+        try:
+            os.remove(temp_path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+        raise
 
 
 def _image_quality_includes_raw(quality_code: int) -> bool:
@@ -272,6 +298,15 @@ def _image_quality_is_raw_only(quality_code: int) -> bool:
         return False
     lower = quality_code & 0xFFFF
     return lower == 0xFF0F
+
+
+def _expected_files_per_shot(quality_code: int) -> int:
+    """Return the host-transfer count expected for one shutter release."""
+    if _image_quality_includes_raw(quality_code) and not _image_quality_is_raw_only(
+        quality_code
+    ):
+        return 2
+    return 1
 
 
 def _is_raw_file(path: str) -> bool:
@@ -340,11 +375,18 @@ class CameraController:
         self._session_open = False
         self._entered = False
         self._atexit_registered = False
+        self._transfer_error: Optional[BaseException] = None
 
     # ---------- Lifecycle ----------
     def __enter__(self) -> "CameraController":
         if self._entered:
             raise RuntimeError("Camera session is already open")
+
+        os.makedirs(self.save_dir, exist_ok=True)
+        if not os.path.isdir(self.save_dir):
+            raise NotADirectoryError(
+                f"Camera save directory is not a directory: {self.save_dir}"
+            )
 
         if self.protected:
             return self._enter_protected()
@@ -586,9 +628,15 @@ class CameraController:
                 except Exception:
                     dst_name = None
 
-            path = _save_directory_item(
-                object_handle, self.save_dir, dst_basename=dst_name
-            )
+            try:
+                path = _save_directory_item(
+                    object_handle, self.save_dir, dst_basename=dst_name
+                )
+            except BaseException as exc:
+                self._transfer_error = exc
+                self._log(f"Image transfer failed: {exc}")
+                code = getattr(exc, "code", None)
+                return int(code) if isinstance(code, int) and code != 0 else 1
             self._saved_paths.append(path)
             self._enqueue_async_event(
                 {
@@ -1030,8 +1078,15 @@ class CameraController:
         interval: float = 0.0,
         retry: int = 0,
         retry_delay: float = 0.3,
+        retry_on_timeout: bool = False,
         filename: Optional[str] = None,
     ) -> List[str]:
+        """Take one or more photos and return every transferred host path.
+
+        A RAW+JPEG shutter release completes only after both files arrive.
+        Retrying after an accepted shutter command can create duplicate photos,
+        so ``retry > 0`` requires the explicit ``retry_on_timeout=True`` opt-in.
+        """
         if self.protected:
             return self._call_worker(
                 "capture",
@@ -1040,43 +1095,108 @@ class CameraController:
                 interval=interval,
                 retry=retry,
                 retry_delay=retry_delay,
+                retry_on_timeout=retry_on_timeout,
                 filename=filename,
             )
         if self._cam is None:
             raise RuntimeError("Camera session not open")
+        if isinstance(shots, bool) or not isinstance(shots, int) or shots < 1:
+            raise ValueError("shots must be an integer greater than or equal to 1")
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout must be finite and greater than zero")
+        if not math.isfinite(interval) or interval < 0:
+            raise ValueError(
+                "interval must be finite and greater than or equal to zero"
+            )
+        if isinstance(retry, bool) or not isinstance(retry, int) or retry < 0:
+            raise ValueError("retry must be an integer greater than or equal to zero")
+        if not math.isfinite(retry_delay) or retry_delay < 0:
+            raise ValueError(
+                "retry_delay must be finite and greater than or equal to zero"
+            )
+        if retry > 0 and not retry_on_timeout:
+            raise ValueError(
+                "retry > 0 can take duplicate photos after a transfer timeout; "
+                "pass retry_on_timeout=True to opt in explicitly"
+            )
+        if not (int(self.save_to) & int(SaveTo.Host)):
+            raise RuntimeError(
+                "capture() requires SaveTo.Host or SaveTo.Both so transfer events "
+                "can be received"
+            )
         self._saved_paths.clear()
+        self._transfer_error = None
         if filename is not None:
             if shots != 1:
                 raise ValueError("filename can be used only when shots=1")
             # Store provided name for next object transfer (extension will be preserved from camera)
             self._next_filename = filename
-        for i in range(max(1, shots)):
+
+        expected_files = _expected_files_per_shot(self.get_image_quality_code())
+        for i in range(shots):
             attempt = 0
             while True:
+                start_count = len(self._saved_paths)
                 try:
                     self._log(f"Trigger shot {i + 1}/{shots}")
                     edsdk.SendCommand(self._cam, CameraCommand.TakePicture, 0)
-                    self._wait_for_transfer(timeout)
+                    self._wait_for_transfer(
+                        timeout,
+                        start_count=start_count,
+                        expected_count=expected_files,
+                    )
                     break
                 except TimeoutError:
+                    if self._transfer_error is not None:
+                        raise
+                    received = len(self._saved_paths) - start_count
+                    if received:
+                        raise
                     if attempt >= retry:
                         raise
                     attempt += 1
-                    self._log(f"Retry shot {i + 1}/{shots} (attempt {attempt}/{retry})")
-                    time.sleep(retry_delay)
+                    self._log(
+                        f"Wait before retrying shot {i + 1}/{shots} "
+                        f"(attempt {attempt}/{retry})"
+                    )
+                    try:
+                        self._wait_for_transfer(
+                            retry_delay,
+                            start_count=start_count,
+                            expected_count=expected_files,
+                        )
+                    except TimeoutError:
+                        if self._transfer_error is not None:
+                            raise
+                        received = len(self._saved_paths) - start_count
+                        if received:
+                            raise
+                        continue
+                    else:
+                        break
             if interval > 0 and i < shots - 1:
                 time.sleep(interval)
         return list(self._saved_paths)
 
-    def _wait_for_transfer(self, timeout: float) -> None:
-        deadline = time.time() + timeout
-        already = len(self._saved_paths)
-        while time.time() < deadline:
+    def _wait_for_transfer(
+        self, timeout: float, *, start_count: int, expected_count: int
+    ) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
             time.sleep(0.01)
             _pump_messages_once()
-            if len(self._saved_paths) > already:
+            if self._transfer_error is not None:
+                raise self._transfer_error
+            received = len(self._saved_paths) - start_count
+            if received >= expected_count:
                 return
-        raise TimeoutError("Timed out waiting for image transfer event")
+        if self._transfer_error is not None:
+            raise self._transfer_error
+        received = max(0, len(self._saved_paths) - start_count)
+        raise TimeoutError(
+            "Timed out waiting for image transfer events "
+            f"(expected {expected_count}, received {received})"
+        )
 
     # ---------- Capture to memory ----------
     def capture_bytes(
@@ -1087,9 +1207,14 @@ class CameraController:
         interval: float = 0.0,
         retry: int = 0,
         retry_delay: float = 0.3,
+        retry_on_timeout: bool = False,
         keep_files: bool = False,
     ) -> List[bytes]:
         """Capture and return image bytes in memory.
+
+        ``retry_on_timeout`` has the same duplicate-photo warning as
+        :meth:`capture`.
+
         Optionally keeps or removes the saved files from disk (default: remove).
         """
         paths = self.capture(
@@ -1098,6 +1223,7 @@ class CameraController:
             interval=interval,
             retry=retry,
             retry_delay=retry_delay,
+            retry_on_timeout=retry_on_timeout,
         )
         data_list: List[bytes] = []
         for p in paths:
@@ -1120,6 +1246,7 @@ class CameraController:
         interval: float = 0.0,
         retry: int = 0,
         retry_delay: float = 0.3,
+        retry_on_timeout: bool = False,
         keep_files: bool = False,
         raw_processor: Optional[RawProcessor] = None,
     ) -> List["np.ndarray"]:
@@ -1133,6 +1260,8 @@ class CameraController:
             interval: Interval in seconds between shots.
             retry: Number of retries on timeout.
             retry_delay: Delay in seconds between retries.
+            retry_on_timeout: Explicitly allow another shutter command after
+                              a transfer timeout. This can create duplicate photos.
             keep_files: If True, keep captured files on disk.
             raw_processor: Callback to develop RAW images.
                            Must conform to RawProcessor protocol:
@@ -1195,6 +1324,7 @@ class CameraController:
             interval=interval,
             retry=retry,
             retry_delay=retry_delay,
+            retry_on_timeout=retry_on_timeout,
         )
 
         arrays: List["np.ndarray"] = []

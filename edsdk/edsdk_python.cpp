@@ -1143,9 +1143,9 @@ PyDoc_STRVAR(PyEds_Download__doc__,
 
 static PyObject* PyEds_Download(PyObject *Py_UNUSED(self), PyObject *args) {
     PyObject *pyDirItemRef;
-    unsigned long long readSize;
+    EdsUInt64 readSize = 0;
     PyObject *pyFileStream;
-    if (!PyArg_ParseTuple(args, "OkO:EdsDownload", &pyDirItemRef, &readSize, &pyFileStream)) {
+    if (!PyArg_ParseTuple(args, "OKO:EdsDownload", &pyDirItemRef, &readSize, &pyFileStream)) {
         return nullptr;
     }
     PyEdsObject* dirItem(PyToEds(pyDirItemRef));

@@ -199,6 +199,28 @@ an exact value. Pass `nearest=True` to snap automatically (matching is
 done in EV / log2 space). `Bulb` and ISO `Auto` are never chosen by
 `nearest`; request them explicitly (`"bulb"` / `"auto"`).
 
+## Capture transfer safety
+
+`capture()` waits for every file produced by one shutter release. JPEG-only
+and RAW-only modes produce one path; RAW+JPEG modes complete after both paths
+have arrived. `shots`, timeout, interval, and retry values are validated
+before the shutter command is sent.
+
+Retrying a transfer timeout means issuing another shutter command even though
+the first image may only be delayed. This can create duplicate photos, so a
+non-zero `retry` requires an explicit opt-in:
+
+```python
+paths = cam.capture(
+    retry=1,
+    retry_delay=0.5,
+    retry_on_timeout=True,
+)
+```
+
+Without `retry_on_timeout=True`, `retry > 0` raises `ValueError`. A partial
+RAW+JPEG transfer is never retried automatically.
+
 ## Safe shutdown and protected camera sessions
 
 `CameraController.close()` is idempotent and is also called by the context
