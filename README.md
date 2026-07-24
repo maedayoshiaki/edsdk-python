@@ -20,16 +20,16 @@ Add to your `pyproject.toml` (works with both pip and uv):
 
 ```toml
 dependencies = [
-  "edsdk-python @ https://github.com/maedayoshiaki/edsdk-python/releases/download/v0.1.8/edsdk_python-0.1.8-cp313-cp313-win_amd64.whl ; python_version == '3.13'",
-  "edsdk-python @ https://github.com/maedayoshiaki/edsdk-python/releases/download/v0.1.8/edsdk_python-0.1.8-cp312-cp312-win_amd64.whl ; python_version == '3.12'",
-  "edsdk-python @ https://github.com/maedayoshiaki/edsdk-python/releases/download/v0.1.8/edsdk_python-0.1.8-cp311-cp311-win_amd64.whl ; python_version == '3.11'",
+  "edsdk-python @ https://github.com/maedayoshiaki/edsdk-python/releases/download/v0.1.9/edsdk_python-0.1.9-cp313-cp313-win_amd64.whl ; python_version == '3.13'",
+  "edsdk-python @ https://github.com/maedayoshiaki/edsdk-python/releases/download/v0.1.9/edsdk_python-0.1.9-cp312-cp312-win_amd64.whl ; python_version == '3.12'",
+  "edsdk-python @ https://github.com/maedayoshiaki/edsdk-python/releases/download/v0.1.9/edsdk_python-0.1.9-cp311-cp311-win_amd64.whl ; python_version == '3.11'",
 ]
 ```
 
 Or install a single wheel directly:
 
 ```cmd
-pip install https://github.com/maedayoshiaki/edsdk-python/releases/download/v0.1.8/edsdk_python-0.1.8-cp313-cp313-win_amd64.whl
+pip install https://github.com/maedayoshiaki/edsdk-python/releases/download/v0.1.9/edsdk_python-0.1.9-cp313-cp313-win_amd64.whl
 ```
 
 You still need Canon EDSDK itself: apply for it through Canon's developer
