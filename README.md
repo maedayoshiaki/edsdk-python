@@ -20,16 +20,16 @@ Add to your `pyproject.toml` (works with both pip and uv):
 
 ```toml
 dependencies = [
-  "edsdk-python @ https://github.com/maedayoshiaki/edsdk-python/releases/download/v0.1.9/edsdk_python-0.1.9-cp313-cp313-win_amd64.whl ; python_version == '3.13'",
-  "edsdk-python @ https://github.com/maedayoshiaki/edsdk-python/releases/download/v0.1.9/edsdk_python-0.1.9-cp312-cp312-win_amd64.whl ; python_version == '3.12'",
-  "edsdk-python @ https://github.com/maedayoshiaki/edsdk-python/releases/download/v0.1.9/edsdk_python-0.1.9-cp311-cp311-win_amd64.whl ; python_version == '3.11'",
+  "edsdk-python @ https://github.com/maedayoshiaki/edsdk-python/releases/download/v0.2.0/edsdk_python-0.2.0-cp313-cp313-win_amd64.whl ; python_version == '3.13'",
+  "edsdk-python @ https://github.com/maedayoshiaki/edsdk-python/releases/download/v0.2.0/edsdk_python-0.2.0-cp312-cp312-win_amd64.whl ; python_version == '3.12'",
+  "edsdk-python @ https://github.com/maedayoshiaki/edsdk-python/releases/download/v0.2.0/edsdk_python-0.2.0-cp311-cp311-win_amd64.whl ; python_version == '3.11'",
 ]
 ```
 
 Or install a single wheel directly:
 
 ```cmd
-pip install https://github.com/maedayoshiaki/edsdk-python/releases/download/v0.1.9/edsdk_python-0.1.9-cp313-cp313-win_amd64.whl
+pip install https://github.com/maedayoshiaki/edsdk-python/releases/download/v0.2.0/edsdk_python-0.2.0-cp313-cp313-win_amd64.whl
 ```
 
 You still need Canon EDSDK itself: apply for it through Canon's developer
@@ -220,6 +220,83 @@ paths = cam.capture(
 
 Without `retry_on_timeout=True`, `retry > 0` raises `ValueError`. A partial
 RAW+JPEG transfer is never retried automatically.
+
+## Triggered one-frame capture mode
+
+Use triggered capture when each user trigger must produce exactly one image.
+Only one trigger is processed at a time: another trigger received while the
+camera is working raises `CameraBusyError` immediately and is never queued.
+Use a protected session for asynchronous calls or calls from arbitrary parent
+threads:
+
+```python
+from edsdk.camera_controller import CameraController
+from edsdk.triggered_capture import CameraBusyError
+
+with CameraController(protected=True) as cam:
+    mode = cam.arm_triggered_capture(
+        transfer="memory",
+        defaults={"tv": "1/125", "av": 5.6, "iso": 400},
+    )
+    try:
+        ticket = mode.trigger(tv="1/250", wait=False)
+        try:
+            mode.trigger(wait=False)
+        except CameraBusyError:
+            pass
+
+        frame = ticket.result(timeout=10)
+        jpeg_or_raw_bytes = frame.assets[0].data
+
+        mode.wait_ready(timeout=10)
+        next_frame = mode.trigger(iso=800, wait=True)
+    finally:
+        mode.disarm()
+```
+
+`transfer="memory"` downloads each camera object directly into a
+Python-owned memory stream and does not create an intermediate host file.
+Readiness is reported only after the transfer has completed.
+
+Use `transfer="deferred_card"` to avoid USB image transfer while triggering.
+This mode requires a writable memory card; arming fails before any shutter
+command if the camera reports no card storage. Camera items are retained in
+trigger order and downloaded later:
+
+```python
+with CameraController(protected=True, save_dir="out") as cam:
+    mode = cam.arm_triggered_capture(
+        transfer="deferred_card",
+        max_deferred_frames=10,
+    )
+    for tv in ("1/60", "1/125", "1/250"):
+        mode.trigger(tv=tv, wait=True)
+
+    frames = mode.drain(output="bytes")  # or output="files"
+    mode.disarm()
+```
+
+Card originals are never deleted automatically. `drain()` can be called
+between groups of triggers. If a transfer fails partway through a RAW+JPEG
+frame, retrying `drain()` resumes at the unfinished asset. `disarm()` requires
+pending card frames to be drained unless `leave_on_card=True` is explicit.
+The last Av/Tv/ISO values remain applied; only the temporary `SaveTo` and
+single-shot drive settings are restored.
+
+For direct (non-protected) sessions, triggered capture is synchronous and must
+run on the thread that opened the camera:
+
+```python
+with CameraController() as cam:
+    mode = cam.arm_triggered_capture(transfer="memory")
+    frame = mode.trigger(wait=True)
+    mode.disarm()
+```
+
+`capture_bytes(keep_files=False)` now uses the same direct memory path when
+timeout retries are disabled. Retry-enabled calls retain the legacy
+file-backed behavior because a late transfer event cannot safely be correlated
+with a retried in-memory shutter command.
 
 ## Safe shutdown and protected camera sessions
 

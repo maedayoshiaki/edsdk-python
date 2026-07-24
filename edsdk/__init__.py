@@ -58,3 +58,12 @@ except ImportError as exc:
     raise
 
 from edsdk.constants import *
+from edsdk.triggered_capture import (
+    CameraBusyError,
+    CaptureTicket,
+    CapturedAsset,
+    CapturedFrame,
+    DeferredBufferFullError,
+    TriggeredCaptureFaultError,
+    TriggeredCaptureMode,
+)

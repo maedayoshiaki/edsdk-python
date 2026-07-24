@@ -9,13 +9,18 @@ import math
 import time
 import uuid
 import inspect
+import threading
+from dataclasses import dataclass, replace
 from enum import IntEnum
 from typing import (
+    Any,
     Callable,
     Dict,
     List,
+    Mapping,
     Optional,
     Protocol,
+    Sequence,
     Tuple,
     Union,
     TYPE_CHECKING,
@@ -40,6 +45,8 @@ from edsdk import (
     ObjectEvent,
     PropID,
     PropertyEvent,
+    StateEvent,
+    StorageType,
 )
 from edsdk.constants.properties import (
     Av as AvTable,
@@ -67,6 +74,13 @@ from edsdk.exposure import (
     resolve_iso,
     resolve_tv,
 )
+from edsdk.triggered_capture import (
+    CapturedAsset,
+    CapturedFrame,
+    DeferredBufferFullError,
+    TriggeredCaptureMode,
+    TriggeredCaptureFaultError,
+)
 
 
 # Public callback / return type aliases (after imports to satisfy linters)
@@ -86,6 +100,16 @@ class CameraEvent(TypedDict, total=False):
 
 
 EventCallback = Callable[[CameraEvent], None]
+
+
+@dataclass
+class _DeferredCapture:
+    """Worker-local card handles and their serializable public frame."""
+
+    frame: CapturedFrame
+    handles: List[EdsObject]
+    downloaded: List[Optional[CapturedAsset]]
+    output: Optional[str] = None
 
 
 class CameraCleanupError(RuntimeError):
@@ -276,6 +300,63 @@ def _save_directory_item(
         raise
 
 
+def _download_directory_item_bytes(
+    object_handle: EdsObject,
+) -> CapturedAsset:
+    """Download one directory item directly into Python-owned memory."""
+
+    info = edsdk.GetDirectoryItemInfo(object_handle)
+    filename = info.get("szFileName") or f"{uuid.uuid4()}.bin"
+    size = int(info["size"])
+    if size < 0:
+        raise ValueError(f"Invalid directory item size: {size}")
+
+    buffer = bytearray(size)
+    stream: Optional[EdsObject] = None
+    completed = False
+    try:
+        stream = edsdk.CreateMemoryStreamFromPointer(buffer)
+        edsdk.Download(object_handle, size, stream)
+        edsdk.DownloadComplete(object_handle)
+        completed = True
+        stream = None
+        return CapturedAsset(
+            filename=str(filename),
+            size=size,
+            data=bytes(buffer),
+        )
+    except BaseException:
+        if not completed:
+            try:
+                edsdk.DownloadCancel(object_handle)
+            except BaseException:
+                pass
+        stream = None
+        raise
+
+
+def _directory_item_asset(object_handle: EdsObject) -> CapturedAsset:
+    info = edsdk.GetDirectoryItemInfo(object_handle)
+    return CapturedAsset(
+        filename=str(info.get("szFileName") or f"{uuid.uuid4()}.bin"),
+        size=int(info["size"]),
+    )
+
+
+def _has_writable_card_storage(camera: EdsObject) -> bool:
+    for index in range(edsdk.GetChildCount(camera)):
+        volume = edsdk.GetChildAtIndex(camera, index)
+        try:
+            info = edsdk.GetVolumeInfo(volume)
+            if info["storageType"] != StorageType.Non and int(info["maxCapacity"]) > 0:
+                return True
+        except Exception:
+            continue
+        finally:
+            volume = None
+    return False
+
+
 def _image_quality_includes_raw(quality_code: int) -> bool:
     """Check if the ImageQuality setting includes RAW capture.
 
@@ -376,6 +457,18 @@ class CameraController:
         self._entered = False
         self._atexit_registered = False
         self._transfer_error: Optional[BaseException] = None
+        self._session_thread_id: Optional[int] = None
+        self._triggered_mode: Optional[TriggeredCaptureMode] = None
+        self._triggered_armed = False
+        self._triggered_internal = False
+        self._triggered_transfer: Optional[str] = None
+        self._triggered_max_deferred_frames = 0
+        self._triggered_original_save_to: Optional[int] = None
+        self._triggered_original_drive_mode: Optional[int] = None
+        self._triggered_active: Optional[Dict[str, Any]] = None
+        self._triggered_error: Optional[BaseException] = None
+        self._triggered_faulted = False
+        self._triggered_deferred: List[_DeferredCapture] = []
 
     # ---------- Lifecycle ----------
     def __enter__(self) -> "CameraController":
@@ -413,6 +506,12 @@ class CameraController:
 
             # Event handlers (property event can be suppressed to avoid noisy warnings)
             edsdk.SetObjectEventHandler(cam, ObjectEvent.All, self._on_object_event)
+            try:
+                edsdk.SetCameraStateEventHandler(
+                    cam, StateEvent.All, self._on_state_event
+                )
+            except Exception as e:
+                self._log(f"Skip state events: {e}")
             if self._register_property_events:
                 try:
                     edsdk.SetPropertyEventHandler(
@@ -434,6 +533,7 @@ class CameraController:
                     },
                 )
             self._entered = True
+            self._session_thread_id = threading.get_ident()
             self._log("Camera session opened")
             return self
         except BaseException:
@@ -485,6 +585,17 @@ class CameraController:
 
     def close(self) -> None:
         """Close the camera session and SDK, safely and idempotently."""
+        if self._triggered_mode is not None:
+            try:
+                self._triggered_mode.disarm(leave_on_card=True)
+            except BaseException as exc:
+                self._log(f"Triggered capture cleanup failed: {exc}")
+                self._triggered_mode = None
+        elif self._triggered_armed:
+            try:
+                self._disarm_triggered_capture(leave_on_card=True)
+            except BaseException as exc:
+                self._log(f"Triggered capture cleanup failed: {exc}")
         if self.protected:
             self._close_protected()
             return
@@ -521,6 +632,7 @@ class CameraController:
 
         self._live_view_on = False
         self._entered = False
+        self._session_thread_id = None
         if not self._sdk_initialized:
             self._unregister_atexit()
         if not errors:
@@ -590,6 +702,14 @@ class CameraController:
         self._event_cb = fn
 
     def _on_object_event(self, event: ObjectEvent, object_handle: EdsObject) -> int:
+        if self._handle_triggered_object_event(event, object_handle):
+            if self._obj_cb:
+                try:
+                    return int(self._obj_cb(event, object_handle))
+                except Exception:
+                    return 0
+            return 0
+
         if event == ObjectEvent.DirItemRequestTransfer:
             # compute custom filename if pattern is provided
             dst_name: Optional[str] = None
@@ -663,6 +783,78 @@ class CameraController:
                 return 0
         return 0
 
+    def _handle_triggered_object_event(
+        self, event: ObjectEvent, object_handle: EdsObject
+    ) -> bool:
+        """Consume object events belonging to the current trigger, if any."""
+        if not self._triggered_armed:
+            return False
+
+        is_memory_transfer = (
+            self._triggered_transfer == "memory"
+            and event == ObjectEvent.DirItemRequestTransfer
+        )
+        is_deferred_item = (
+            self._triggered_transfer == "deferred_card"
+            and event == ObjectEvent.DirItemCreated
+        )
+        if not (is_memory_transfer or is_deferred_item):
+            return False
+
+        active = self._triggered_active
+        if active is None:
+            # A late event cannot be correlated with another trigger safely.
+            self._triggered_faulted = True
+            self._triggered_error = TriggeredCaptureFaultError(
+                "Received a late camera object event with no active trigger"
+            )
+            if is_memory_transfer:
+                try:
+                    edsdk.DownloadCancel(object_handle)
+                except BaseException:
+                    pass
+            return True
+
+        try:
+            if is_memory_transfer:
+                active["assets"].append(_download_directory_item_bytes(object_handle))
+            else:
+                active["assets"].append(_directory_item_asset(object_handle))
+                active["handles"].append(object_handle)
+        except BaseException as exc:
+            self._triggered_error = exc
+
+        self._enqueue_async_event(
+            {
+                "kind": "object",
+                "event": event.name if hasattr(event, "name") else int(event),
+            }
+        )
+        return True
+
+    def _on_state_event(self, event: StateEvent, event_data: int) -> int:
+        if self._triggered_armed and event == StateEvent.CaptureError:
+            self._triggered_error = RuntimeError(
+                f"Camera reported capture error 0x{int(event_data):X}"
+            )
+        elif self._triggered_armed and event in {
+            StateEvent.Shutdown,
+            StateEvent.InternalError,
+        }:
+            self._triggered_faulted = True
+            self._triggered_error = TriggeredCaptureFaultError(
+                f"Camera state error: {getattr(event, 'name', event)} "
+                f"(0x{int(event_data):X})"
+            )
+        self._enqueue_async_event(
+            {
+                "kind": "state",
+                "event": event.name if hasattr(event, "name") else int(event),
+                "param": int(event_data),
+            }
+        )
+        return 0
+
     def _on_property_event(
         self, event: PropertyEvent, prop_id: PropID, param: int
     ) -> int:
@@ -706,6 +898,7 @@ class CameraController:
         validate: bool = True,
         tolerate_not_supported: bool = False,
     ) -> None:
+        self._reject_if_triggered_operation("set_properties")
         if self.protected:
             self._call_worker(
                 "set_properties",
@@ -854,6 +1047,15 @@ class CameraController:
             return
         self._require_session()
 
+    def _reject_if_triggered_operation(self, operation: str) -> None:
+        if self._triggered_internal:
+            return
+        if self._triggered_mode is not None or self._triggered_armed:
+            raise RuntimeError(
+                f"{operation}() is unavailable while triggered capture is armed; "
+                "use the TriggeredCaptureMode object"
+            )
+
     def _call_worker(self, method: str, *args, **kwargs):
         worker = self._worker
         if not self._entered or worker is None:
@@ -888,6 +1090,7 @@ class CameraController:
             value: f-number (5.6), string ("f/5.6", "5.6"), or Aperture.
             nearest: Snap to the nearest supported value instead of raising.
         """
+        self._reject_if_triggered_operation("set_av")
         if self.protected:
             return self._call_worker("set_av", value, nearest=nearest)
         cam = self._require_session()
@@ -905,6 +1108,7 @@ class CameraController:
             value: seconds (0.008), string ("1/125", "0.5s", "bulb"), or ShutterSpeed.
             nearest: Snap to the nearest supported value instead of raising.
         """
+        self._reject_if_triggered_operation("set_tv")
         if self.protected:
             return self._call_worker("set_tv", value, nearest=nearest)
         cam = self._require_session()
@@ -922,6 +1126,7 @@ class CameraController:
             value: ISO value (400, 0=Auto), string ("400", "auto"), or ISOSpeed.
             nearest: Snap to the nearest supported value instead of raising.
         """
+        self._reject_if_triggered_operation("set_iso")
         if self.protected:
             return self._call_worker("set_iso", value, nearest=nearest)
         cam = self._require_session()
@@ -1069,6 +1274,414 @@ class CameraController:
         """Check if current ImageQuality setting is RAW-only (no JPEG/HEIF)."""
         return _image_quality_is_raw_only(self.get_image_quality_code())
 
+    # ---------- Triggered one-frame capture ----------
+    def arm_triggered_capture(
+        self,
+        *,
+        transfer: str = "memory",
+        defaults: Optional[Mapping[str, Any]] = None,
+        max_deferred_frames: int = 10,
+    ) -> TriggeredCaptureMode:
+        """Arm a single-flight, one-trigger/one-frame capture mode."""
+        self._ensure_open()
+        if (
+            not self.protected
+            and self._session_thread_id is not None
+            and threading.get_ident() != self._session_thread_id
+        ):
+            raise RuntimeError(
+                "Direct triggered capture must be armed on the thread "
+                "that opened the camera session"
+            )
+        if self._triggered_mode is not None or self._triggered_armed:
+            raise RuntimeError("Triggered capture mode is already armed")
+        if transfer not in {"memory", "deferred_card"}:
+            raise ValueError("transfer must be 'memory' or 'deferred_card'")
+        if (
+            isinstance(max_deferred_frames, bool)
+            or not isinstance(max_deferred_frames, int)
+            or max_deferred_frames < 1
+        ):
+            raise ValueError("max_deferred_frames must be an integer >= 1")
+
+        defaults_dict = dict(defaults or {})
+        unknown = set(defaults_dict) - {"av", "tv", "iso"}
+        if unknown:
+            raise ValueError(
+                "Unknown triggered-capture defaults: " + ", ".join(sorted(unknown))
+            )
+
+        supported_codes = {
+            "av": [entry.code for entry in self.supported_av()],
+            "tv": [entry.code for entry in self.supported_tv()],
+            "iso": [entry.code for entry in self.supported_iso()],
+        }
+        if defaults_dict.get("av") is not None:
+            resolve_av(defaults_dict["av"], supported_codes["av"])
+        if defaults_dict.get("tv") is not None:
+            resolve_tv(defaults_dict["tv"], supported_codes["tv"])
+        if defaults_dict.get("iso") is not None:
+            resolve_iso(defaults_dict["iso"], supported_codes["iso"])
+
+        if self.protected:
+            self._call_worker(
+                "_arm_triggered_capture",
+                transfer=transfer,
+                defaults=defaults_dict,
+                max_deferred_frames=max_deferred_frames,
+            )
+        else:
+            self._arm_triggered_capture(
+                transfer=transfer,
+                defaults=defaults_dict,
+                max_deferred_frames=max_deferred_frames,
+            )
+
+        mode = TriggeredCaptureMode(
+            self,
+            transfer=transfer,
+            supported_codes=supported_codes,
+            max_deferred_frames=max_deferred_frames,
+        )
+        self._triggered_mode = mode
+        return mode
+
+    def _arm_triggered_capture(
+        self,
+        *,
+        transfer: str,
+        defaults: Mapping[str, Any],
+        max_deferred_frames: int,
+    ) -> None:
+        if self.protected:
+            raise RuntimeError("Internal arm operation must run in the camera worker")
+        cam = self._require_session()
+        if self._triggered_armed:
+            raise RuntimeError("Triggered capture mode is already armed")
+
+        original_save_to = int(edsdk.GetPropertyData(cam, PropID.SaveTo, 0))
+        original_drive_mode = int(edsdk.GetPropertyData(cam, PropID.DriveMode, 0))
+        target_save_to = (
+            int(SaveTo.Host) if transfer == "memory" else int(SaveTo.Camera)
+        )
+        if transfer == "deferred_card" and not _has_writable_card_storage(cam):
+            raise RuntimeError(
+                "deferred_card requires a writable memory card in the camera"
+            )
+        changed_save_to = False
+        changed_drive_mode = False
+        self._triggered_internal = True
+        try:
+            edsdk.SetPropertyData(cam, PropID.SaveTo, 0, target_save_to)
+            changed_save_to = True
+            if transfer == "memory" and self.auto_capacity:
+                edsdk.SetCapacity(
+                    cam,
+                    {
+                        "reset": True,
+                        "bytesPerSector": 512,
+                        "numberOfFreeClusters": 2_147_483_647,
+                    },
+                )
+            edsdk.SetPropertyData(
+                cam,
+                PropID.DriveMode,
+                0,
+                int(DriveMode.SingleShooting),
+            )
+            changed_drive_mode = True
+
+            self._triggered_armed = True
+            self._triggered_transfer = transfer
+            self._triggered_max_deferred_frames = max_deferred_frames
+            self._triggered_original_save_to = original_save_to
+            self._triggered_original_drive_mode = original_drive_mode
+            self._triggered_active = None
+            self._triggered_error = None
+            self._triggered_faulted = False
+            self._triggered_deferred.clear()
+
+            if any(value is not None for value in defaults.values()):
+                self.set_properties(
+                    av=defaults.get("av"),
+                    tv=defaults.get("tv"),
+                    iso=defaults.get("iso"),
+                )
+        except BaseException:
+            self._triggered_armed = False
+            if changed_drive_mode:
+                try:
+                    edsdk.SetPropertyData(cam, PropID.DriveMode, 0, original_drive_mode)
+                except BaseException:
+                    pass
+            if changed_save_to:
+                try:
+                    edsdk.SetPropertyData(cam, PropID.SaveTo, 0, original_save_to)
+                except BaseException:
+                    pass
+            raise
+        finally:
+            self._triggered_internal = False
+
+    def _current_trigger_settings(self) -> Dict[str, str]:
+        return {
+            "av": str(self.get_av()),
+            "tv": str(self.get_tv()),
+            "iso": str(self.get_iso()),
+        }
+
+    def _trigger_mode_set_properties(
+        self,
+        *,
+        av: Any = None,
+        tv: Any = None,
+        iso: Any = None,
+        nearest: bool = False,
+    ) -> Mapping[str, str]:
+        if self.protected:
+            return self._call_worker(
+                "_trigger_mode_set_properties",
+                av=av,
+                tv=tv,
+                iso=iso,
+                nearest=nearest,
+            )
+        if not self._triggered_armed:
+            raise RuntimeError("Triggered capture mode is not armed")
+        if self._triggered_active is not None:
+            raise RuntimeError("A triggered capture is already active")
+        self._triggered_internal = True
+        try:
+            self.set_properties(
+                av=av,
+                tv=tv,
+                iso=iso,
+                nearest=nearest,
+            )
+            return self._current_trigger_settings()
+        finally:
+            self._triggered_internal = False
+
+    def _trigger_capture_one(
+        self,
+        *,
+        trigger_id: str,
+        accepted_at: float,
+        av: Any = None,
+        tv: Any = None,
+        iso: Any = None,
+        timeout: Optional[float] = None,
+    ) -> CapturedFrame:
+        if self.protected:
+            return self._call_worker(
+                "_trigger_capture_one",
+                trigger_id=trigger_id,
+                accepted_at=accepted_at,
+                av=av,
+                tv=tv,
+                iso=iso,
+                timeout=timeout,
+            )
+        if not self._triggered_armed:
+            raise RuntimeError("Triggered capture mode is not armed")
+        if self._triggered_faulted:
+            raise TriggeredCaptureFaultError(
+                "Triggered capture mode is faulted; disarm and arm it again"
+            )
+        if self._triggered_active is not None:
+            raise RuntimeError("A triggered capture is already active")
+        if (
+            self._triggered_transfer == "deferred_card"
+            and len(self._triggered_deferred) >= self._triggered_max_deferred_frames
+        ):
+            raise DeferredBufferFullError(
+                "Deferred card buffer is full; drain before triggering again"
+            )
+
+        requested = {"av": av, "tv": tv, "iso": iso}
+        if any(value is not None for value in requested.values()):
+            applied = dict(
+                self._trigger_mode_set_properties(
+                    av=av,
+                    tv=tv,
+                    iso=iso,
+                )
+            )
+        else:
+            applied = self._current_trigger_settings()
+
+        quality_code = self.get_image_quality_code()
+        expected_files = _expected_files_per_shot(quality_code)
+        started_at = time.time()
+        active: Dict[str, Any] = {
+            "trigger_id": trigger_id,
+            "accepted_at": float(accepted_at),
+            "started_at": started_at,
+            "requested": requested,
+            "applied": applied,
+            "assets": [],
+            "handles": [],
+        }
+        self._triggered_active = active
+        self._triggered_error = None
+
+        wait_timeout = timeout
+        if wait_timeout is None:
+            tv_value = self.get_tv().seconds
+            wait_timeout = max(30.0, (tv_value or 0.0) + 10.0)
+        if not math.isfinite(wait_timeout) or wait_timeout <= 0:
+            self._triggered_active = None
+            raise ValueError("timeout must be finite and greater than zero")
+
+        command_sent = False
+        try:
+            edsdk.SendCommand(self._require_session(), CameraCommand.TakePicture, 0)
+            command_sent = True
+            deadline = time.monotonic() + wait_timeout
+            while time.monotonic() < deadline:
+                _pump_messages_once()
+                if self._triggered_error is not None:
+                    raise self._triggered_error
+                if len(active["assets"]) >= expected_files:
+                    break
+                time.sleep(0.005)
+            else:
+                self._triggered_faulted = True
+                raise TriggeredCaptureFaultError(
+                    "Timed out waiting for triggered capture events "
+                    f"(expected {expected_files}, received "
+                    f"{len(active['assets'])})"
+                )
+
+            frame = CapturedFrame(
+                trigger_id=trigger_id,
+                accepted_at=float(accepted_at),
+                started_at=started_at,
+                completed_at=time.time(),
+                requested=dict(requested),
+                applied=dict(applied),
+                assets=tuple(active["assets"]),
+            )
+            if self._triggered_transfer == "deferred_card":
+                self._triggered_deferred.append(
+                    _DeferredCapture(
+                        frame=frame,
+                        handles=list(active["handles"]),
+                        downloaded=[None] * len(active["handles"]),
+                    )
+                )
+            return frame
+        except BaseException as exc:
+            if command_sent and not isinstance(exc, TriggeredCaptureFaultError):
+                self._triggered_faulted = True
+                raise TriggeredCaptureFaultError(
+                    "Triggered capture failed after the shutter command was "
+                    "accepted; disarm and arm again before another trigger"
+                ) from exc
+            raise
+        finally:
+            self._triggered_active = None
+
+    def _drain_triggered_capture(self, *, output: str = "bytes") -> List[CapturedFrame]:
+        if self.protected:
+            return self._call_worker("_drain_triggered_capture", output=output)
+        if not self._triggered_armed:
+            raise RuntimeError("Triggered capture mode is not armed")
+        if self._triggered_transfer != "deferred_card":
+            raise RuntimeError("drain is available only in deferred_card mode")
+        if self._triggered_active is not None:
+            raise RuntimeError("A triggered capture is already active")
+        if output not in {"bytes", "files"}:
+            raise ValueError("output must be 'bytes' or 'files'")
+
+        results: List[CapturedFrame] = []
+        while self._triggered_deferred:
+            pending = self._triggered_deferred[0]
+            if pending.output is not None and pending.output != output:
+                raise RuntimeError(
+                    "A partially drained frame must be retried with "
+                    f"output={pending.output!r}"
+                )
+            pending.output = output
+            for index, handle in enumerate(pending.handles):
+                if pending.downloaded[index] is not None:
+                    continue
+                if output == "bytes":
+                    asset = _download_directory_item_bytes(handle)
+                else:
+                    metadata = _directory_item_asset(handle)
+                    path = _save_directory_item(handle, self.save_dir)
+                    asset = replace(metadata, path=path)
+                pending.downloaded[index] = asset
+
+            frame = replace(
+                pending.frame,
+                completed_at=time.time(),
+                assets=tuple(
+                    asset for asset in pending.downloaded if asset is not None
+                ),
+            )
+            results.append(frame)
+            self._triggered_deferred.pop(0)
+        return results
+
+    def _disarm_triggered_capture(self, *, leave_on_card: bool = False) -> None:
+        if self.protected:
+            try:
+                self._call_worker(
+                    "_disarm_triggered_capture",
+                    leave_on_card=leave_on_card,
+                )
+            finally:
+                self._triggered_mode = None
+            return
+        if not self._triggered_armed:
+            self._triggered_mode = None
+            return
+        if self._triggered_active is not None:
+            raise RuntimeError("A triggered capture is still active")
+        if self._triggered_deferred and not leave_on_card:
+            raise RuntimeError(
+                "Deferred captures are pending; call drain(), pass "
+                "drain_output to disarm(), or set leave_on_card=True"
+            )
+
+        cam = self._require_session()
+        errors: List[Tuple[str, BaseException]] = []
+        if leave_on_card:
+            self._triggered_deferred.clear()
+        try:
+            if self._triggered_original_drive_mode is not None:
+                edsdk.SetPropertyData(
+                    cam,
+                    PropID.DriveMode,
+                    0,
+                    self._triggered_original_drive_mode,
+                )
+        except BaseException as exc:
+            errors.append(("restore_drive_mode", exc))
+        try:
+            if self._triggered_original_save_to is not None:
+                edsdk.SetPropertyData(
+                    cam,
+                    PropID.SaveTo,
+                    0,
+                    self._triggered_original_save_to,
+                )
+        except BaseException as exc:
+            errors.append(("restore_save_to", exc))
+        finally:
+            self._triggered_armed = False
+            self._triggered_transfer = None
+            self._triggered_active = None
+            self._triggered_error = None
+            self._triggered_faulted = False
+            self._triggered_original_drive_mode = None
+            self._triggered_original_save_to = None
+            self._triggered_mode = None
+        if errors:
+            raise CameraCleanupError(errors)
+
     # ---------- Capture ----------
     def capture(
         self,
@@ -1087,6 +1700,7 @@ class CameraController:
         Retrying after an accepted shutter command can create duplicate photos,
         so ``retry > 0`` requires the explicit ``retry_on_timeout=True`` opt-in.
         """
+        self._reject_if_triggered_operation("capture")
         if self.protected:
             return self._call_worker(
                 "capture",
@@ -1217,6 +1831,38 @@ class CameraController:
 
         Optionally keeps or removes the saved files from disk (default: remove).
         """
+        # Retried captures preserve the legacy path-based semantics because a
+        # timeout can leave a late object event that cannot safely be correlated
+        # with a new in-memory trigger. The common no-retry path is truly
+        # diskless.
+        if not keep_files and retry == 0 and not isinstance(retry, bool):
+            if isinstance(shots, bool) or not isinstance(shots, int) or shots < 1:
+                raise ValueError("shots must be an integer greater than or equal to 1")
+            if not math.isfinite(timeout) or timeout <= 0:
+                raise ValueError("timeout must be finite and greater than zero")
+            if not math.isfinite(interval) or interval < 0:
+                raise ValueError(
+                    "interval must be finite and greater than or equal to zero"
+                )
+            if not math.isfinite(retry_delay) or retry_delay < 0:
+                raise ValueError(
+                    "retry_delay must be finite and greater than or equal to zero"
+                )
+            mode = self.arm_triggered_capture(transfer="memory")
+            memory_data: List[bytes] = []
+            try:
+                for index in range(shots):
+                    frame = mode.trigger(wait=True, timeout=timeout)
+                    assert isinstance(frame, CapturedFrame)
+                    memory_data.extend(
+                        asset.data for asset in frame.assets if asset.data is not None
+                    )
+                    if interval > 0 and index < shots - 1:
+                        time.sleep(interval)
+                return memory_data
+            finally:
+                mode.disarm(leave_on_card=True)
+
         paths = self.capture(
             shots=shots,
             timeout=timeout,

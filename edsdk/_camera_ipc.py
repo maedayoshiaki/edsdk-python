@@ -16,6 +16,11 @@ from multiprocessing.connection import Connection, Listener
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 from edsdk.camera_controller import CameraWorkerError, CameraWorkerTimeoutError
+from edsdk.triggered_capture import (
+    CameraBusyError,
+    DeferredBufferFullError,
+    TriggeredCaptureFaultError,
+)
 
 if TYPE_CHECKING:
     from edsdk.camera_controller import CameraEvent
@@ -35,6 +40,9 @@ def _remote_exception(payload: Dict[str, Any]) -> BaseException:
         "TimeoutError": TimeoutError,
         "RuntimeError": RuntimeError,
         "FileNotFoundError": FileNotFoundError,
+        "CameraBusyError": CameraBusyError,
+        "DeferredBufferFullError": DeferredBufferFullError,
+        "TriggeredCaptureFaultError": TriggeredCaptureFaultError,
     }
     exc_type = known.get(name)
     if exc_type is None:

@@ -9,7 +9,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "edsdk-python"
-version = "0.1.9"  # 撮影・転送・低水準APIの安全性強化バージョン
+version = "0.2.0"  # 1トリガー1枚の高速撮影モード追加バージョン
 description = "Python wrapper for Canon EDSDK Library"
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.8"
