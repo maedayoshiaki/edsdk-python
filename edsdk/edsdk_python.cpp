@@ -15,12 +15,21 @@
 typedef struct {
     PyObject_HEAD
     EdsBaseRef edsObj;
+    Py_buffer bufferView;
+    bool hasBufferView;
 } PyEdsObject;
 
 
 static void PyEdsObject_dealloc(PyEdsObject* self)
 {
-	EdsRelease(self->edsObj);
+    if (self->edsObj != nullptr) {
+        EdsRelease(self->edsObj);
+        self->edsObj = nullptr;
+    }
+    if (self->hasBufferView) {
+        PyBuffer_Release(&self->bufferView);
+        self->hasBufferView = false;
+    }
 	Py_TYPE(self)->tp_free((PyObject*) self);
 }
 
@@ -268,16 +277,27 @@ bool PyCallable_CheckNumberOfParameters(PyObject* callable, const long n){
 }
 
 
-inline PyObject* PyEdsObject_New(EdsBaseRef inObject) {
+inline PyObject* PyEdsObject_New(
+        EdsBaseRef inObject,
+        Py_buffer *ownedBufferView = nullptr) {
     if (!inObject) {
         PyErr_Format(PyExc_TypeError, "EdsBaseRef expected %p", inObject);
+        return nullptr;
     }
     PyEdsObject* pyObj = (PyEdsObject*)PyObject_New(PyEdsObject, &PyEdsObjectType);
     if (!pyObj) {
-        PyErr_Format(PyExc_MemoryError, "failed to create EdsObject");
+        EdsRelease(inObject);
+        PyErr_NoMemory();
         return nullptr;
     }
     pyObj->edsObj = inObject;
+    pyObj->hasBufferView = false;
+    std::memset(&pyObj->bufferView, 0, sizeof(pyObj->bufferView));
+    if (ownedBufferView != nullptr) {
+        pyObj->bufferView = *ownedBufferView;
+        pyObj->hasBufferView = true;
+        ownedBufferView->obj = nullptr;
+    }
     return (PyObject*)pyObj;
 }
 
@@ -287,7 +307,12 @@ inline PyEdsObject* PyToEds(PyObject* inObject) {
         PyErr_Format(PyExc_ValueError, "invalid EdsObject %p", inObject);
         return nullptr;
     }
-    return reinterpret_cast<PyEdsObject*>(inObject);
+    PyEdsObject *edsObject = reinterpret_cast<PyEdsObject*>(inObject);
+    if (edsObject->edsObj == nullptr) {
+        PyErr_SetString(PyExc_ValueError, "EdsObject has already been released");
+        return nullptr;
+    }
+    return edsObject;
 }
 
 
@@ -1522,6 +1547,7 @@ static PyObject* PyEds_DeleteDirectoryItem(PyObject *Py_UNUSED(self), PyObject *
     }
     unsigned long retVal(EdsDeleteDirectoryItem(dirItem->edsObj));
     PyCheck_EDSERROR(retVal);
+    dirItem->edsObj = nullptr;
 
     Py_RETURN_NONE;
 }
@@ -1834,44 +1860,46 @@ static PyObject* PyEds_CreateFileStreamEx(PyObject *Py_UNUSED(self), PyObject *a
 PyDoc_STRVAR(PyEds_CreateMemoryStreamFromPointer__doc__,
 "Creates a stream from the memory buffer you prepare.\n"
 "Unlike the buffer size of streams created by means of EdsCreateMemoryStream,\n"
-"the buffer size you prepare for streams created this way does not expand.\n\n"
-":param Union[bytes, bytearray, memoryview] buffer: The buffer.\n"
+"the buffer size you prepare for streams created this way does not expand.\n"
+"The buffer must be writable and C-contiguous, and cannot be resized while\n"
+"\tthe returned stream exists.\n\n"
+":param Union[bytearray, memoryview] buffer: The writable buffer.\n"
+":raises TypeError: If the object is not a bytearray or memoryview.\n"
+":raises BufferError: If the buffer is read-only or not C-contiguous.\n"
 ":raises EdsError: Any of the sdk errors.\n"
 ":return EdsObject: The stream.");
 
 static PyObject* PyEds_CreateMemoryStreamFromPointer(PyObject *Py_UNUSED(self), PyObject *pyBufferLike){
-    void * bufferPtr = nullptr;
-    Py_ssize_t bufferLen = 0;
-
-    if (PyMemoryView_Check(pyBufferLike)) {
-        Py_buffer *pyBuffer = PyMemoryView_GET_BUFFER(pyBufferLike);
-        if (pyBuffer->readonly) {
-            PyErr_SetString(PyExc_ValueError, "Buffer is read-only");
-            return nullptr;
-        }
-        bufferPtr = pyBuffer->buf;
-        bufferLen = pyBuffer->len;
-    }
-    else if (PyBytes_Check(pyBufferLike)) {
-        bufferPtr = PyBytes_AS_STRING(pyBufferLike);
-        bufferLen = PyBytes_GET_SIZE(pyBufferLike);
-    }
-    else if (PyByteArray_Check(pyBufferLike)) {
-        bufferPtr = PyByteArray_AS_STRING(pyBufferLike);
-        bufferLen = PyByteArray_GET_SIZE(pyBufferLike);
-    }
-    else {
-        PyErr_SetString(PyExc_TypeError, "buffer parameter must be a bytes, bytearray, or memoryview");
+    if (!PyByteArray_Check(pyBufferLike) &&
+            !PyMemoryView_Check(pyBufferLike)) {
+        PyErr_SetString(
+            PyExc_TypeError,
+            "buffer parameter must be a writable bytearray or memoryview");
         return nullptr;
     }
+
+    Py_buffer bufferView{};
+    if (PyObject_GetBuffer(
+            pyBufferLike,
+            &bufferView,
+            PyBUF_WRITABLE | PyBUF_C_CONTIGUOUS) != 0) {
+        return nullptr;
+    }
+
     EdsStreamRef fileStream;
+    const unsigned long retVal(EdsCreateMemoryStreamFromPointer(
+        bufferView.buf,
+        static_cast<EdsUInt64>(bufferView.len),
+        &fileStream));
+    if (retVal != EDS_ERR_OK) {
+        PyBuffer_Release(&bufferView);
+        PyCheck_EDSERROR(retVal);
+    }
 
-    unsigned long retVal(EdsCreateMemoryStreamFromPointer(
-        bufferPtr, bufferLen, &fileStream));
-    PyCheck_EDSERROR(retVal);
-
-    PyObject *pyFileStream = PyEdsObject_New(fileStream);
-    assert(pyFileStream);
+    PyObject *pyFileStream = PyEdsObject_New(fileStream, &bufferView);
+    if (bufferView.obj != nullptr) {
+        PyBuffer_Release(&bufferView);
+    }
     return pyFileStream;
 }
 

@@ -340,13 +340,17 @@ def CreateMemoryStream(buffer_size: int) -> EdsObject:
     ...
 
 def CreateMemoryStreamFromPointer(
-    buffer: Union[bytes, bytearray, memoryview],
+    buffer: Union[bytearray, memoryview],
 ) -> EdsObject:
     """Creates a stream from the memory buffer you prepare.
     Unlike the buffer size of streams created by means of EdsCreateMemoryStream,
     the buffer size you prepare for streams created this way does not expand.
+    The buffer must be writable and C-contiguous, and cannot be resized while
+        the returned stream exists.
 
-    :param Union[bytes, bytearray, memoryview] buffer: The buffer.
+    :param Union[bytearray, memoryview] buffer: The writable buffer.
+    :raises TypeError: If the object is not a bytearray or memoryview.
+    :raises BufferError: If the buffer is read-only or not C-contiguous.
     :raises EdsError: Any of the sdk errors.
     :return EdsObject: The stream.
     """
