@@ -49,6 +49,23 @@ static PyTypeObject PyEdsObjectType = {
 
 
 static PyObject *PyEdsError;
+static PyObject *pyProgressCallback[2] = {nullptr, nullptr};
+static PyObject *pyCameraAddedCallback[2] = {nullptr, nullptr};
+static PyObject *pySetPropertyCallback[2] = {nullptr, nullptr};
+static PyObject *pySetObjectCallback[2] = {nullptr, nullptr};
+static PyObject *pySetCameraStateCallback[2] = {nullptr, nullptr};
+
+
+static void ClearPythonCallbackReferences()
+{
+    for (int i = 0; i < 2; ++i) {
+        Py_CLEAR(pyProgressCallback[i]);
+        Py_CLEAR(pyCameraAddedCallback[i]);
+        Py_CLEAR(pySetPropertyCallback[i]);
+        Py_CLEAR(pySetObjectCallback[i]);
+        Py_CLEAR(pySetCameraStateCallback[i]);
+    }
+}
 
 
 static PyObject *PyEdsError_tp_str(PyObject *self)
@@ -192,6 +209,9 @@ PyDoc_STRVAR(PyEds_TerminateSDK__doc__,
 
 static PyObject* PyEds_TerminateSDK(PyObject *Py_UNUSED(self)) {
     unsigned long retVal(EdsTerminateSDK());
+    if (retVal == EDS_ERR_OK) {
+        ClearPythonCallbackReferences();
+    }
     PyCheck_EDSERROR(retVal);
     Py_RETURN_NONE;
 }
@@ -1529,8 +1549,6 @@ static PyObject* PyEds_CopyData(PyObject *Py_UNUSED(self), PyObject *args){
 }
 
 
-static PyObject *pyProgressCallback[2] = {nullptr, nullptr};
-
 PyDoc_STRVAR(PyEds_SetProgressCallback__doc__,
 "Register a progress callback function.\n"
 "An event is received as notification of progress during processing that\n"
@@ -1630,8 +1648,8 @@ static PyObject* PyEds_SetProgressCallback(PyObject *Py_UNUSED(self), PyObject *
         pyProgressCallback));
 
     if (retVal != EDS_ERR_OK) {
-        Py_DECREF(pyCallable);
-        Py_XDECREF(pyContext);
+        Py_CLEAR(pyProgressCallback[0]);
+        Py_CLEAR(pyProgressCallback[1]);
         PyCheck_EDSERROR(retVal);
     }
     Py_RETURN_NONE;
@@ -1824,8 +1842,6 @@ static PyObject* PyEds_DownloadEvfImage(PyObject *Py_UNUSED(self), PyObject *arg
 }
 
 
-static PyObject *pyCameraAddedCallback[2] = {nullptr, nullptr};
-
 PyDoc_STRVAR(PyEds_SetCameraAddedHandler__doc__,
 "Registers a callback function for when a camera is detected.\n\n"
 ":param Callable callback: the callback called when a camera is connected.\n"
@@ -1894,15 +1910,13 @@ static PyObject* PyEds_SetCameraAddedHandler(PyObject *Py_UNUSED(self), PyObject
             pyCameraAddedCallback));
 
     if (retVal != EDS_ERR_OK) {
-        Py_DECREF(pyCallable);
-        Py_XDECREF(pyContext);
+        Py_CLEAR(pyCameraAddedCallback[0]);
+        Py_CLEAR(pyCameraAddedCallback[1]);
         PyCheck_EDSERROR(retVal);
     }
     Py_RETURN_NONE;
 }
 
-
-static PyObject *pySetPropertyCallback[2] = {nullptr, nullptr};
 
 PyDoc_STRVAR(PyEds_SetPropertyEventHandler__doc__,
 "Registers a callback function for receiving status\n"
@@ -2004,16 +2018,14 @@ static PyObject* PyEds_SetPropertyEventHandler(PyObject *Py_UNUSED(self), PyObje
         edsObj->edsObj, event, callbackWrapper, pySetPropertyCallback));
 
     if (retVal != EDS_ERR_OK) {
-        Py_DECREF(pyCallable);
-        Py_XDECREF(pyContext);
+        Py_CLEAR(pySetPropertyCallback[0]);
+        Py_CLEAR(pySetPropertyCallback[1]);
         PyCheck_EDSERROR(retVal);
     }
     Py_RETURN_NONE;
 
 }
 
-
-static PyObject *pySetObjectCallback[2] = {nullptr, nullptr};
 
 PyDoc_STRVAR(PyEds_SetObjectEventHandler__doc__,
 "Registers a callback function for receiving status\n"
@@ -2106,15 +2118,13 @@ static PyObject* PyEds_SetObjectEventHandler(PyObject *Py_UNUSED(self), PyObject
         edsObj->edsObj, event, callbackWrapper, pySetObjectCallback));
 
     if (retVal != EDS_ERR_OK) {
-        Py_DECREF(pyCallable);
-        Py_XDECREF(pyContext);
+        Py_CLEAR(pySetObjectCallback[0]);
+        Py_CLEAR(pySetObjectCallback[1]);
         PyCheck_EDSERROR(retVal);
     }
     Py_RETURN_NONE;
 }
 
-
-PyObject *pySetCameraStateCallback[2] = {nullptr, nullptr};
 
 PyDoc_STRVAR(PyEds_SetCameraStateEventHandler__doc__,
 "Registers a callback function for receiving status\n"
@@ -2208,8 +2218,8 @@ static PyObject *PyEds_SetCameraStateEventHandler(PyObject *Py_UNUSED(self), PyO
             pySetCameraStateCallback));
 
     if (retVal != EDS_ERR_OK) {
-        Py_DECREF(pyCallable);
-        Py_XDECREF(pyContext);
+        Py_CLEAR(pySetCameraStateCallback[0]);
+        Py_CLEAR(pySetCameraStateCallback[1]);
         PyCheck_EDSERROR(retVal);
     }
     Py_RETURN_NONE;

@@ -96,3 +96,7 @@ python examples\capture_cli.py --load-profile config\studioA.json --no-validate
 
 - 例外発生時は EDSDK のエラーコードを含むメッセージで表示されます（`classify_error` を内部利用）。
 - Python から直接使う場合は、`CameraController.enable_async()` と `pump_events()` を使って非同期でイベント（撮影完了など）を受け取ることもできます。
+- Windows で親アプリが強制終了される可能性がある場合は
+  `CameraController(protected=True)` または CLI の `--protected` を使います。
+  親プロセスだけの `taskkill /F` には対応しますが、ワーカーも終了する
+  `taskkill /T /F` では後処理できません。
