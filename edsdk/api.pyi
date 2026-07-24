@@ -275,15 +275,15 @@ def DownloadComplete(dir_item: EdsObject) -> None:
     """
     ...
 
-def DownloadThumbnail(dir_item: EdsObject) -> EdsObject:
+def DownloadThumbnail(dir_item: EdsObject, stream: EdsObject) -> None:
     """Extracts and downloads thumbnail information from image files in a camera.
     Thumbnail information in the camera's image files is downloaded
         to the host computer.
     Downloaded thumbnails are sent directly to a file stream created in advance.
 
     :param EdsObject dir_item: The directory item.
+    :param EdsObject stream: The memory or file stream for the thumbnail.
     :raises EdsError: Any of the sdk errors.
-    :return EdsObject: The stream.
     """
     ...
 
@@ -464,7 +464,8 @@ def GetImage(
     image_type: TargetImageType,
     source_rect: Dict[str, Dict[str, int]],
     dest_size: Dict[str, int],
-) -> EdsObject:
+    stream: EdsObject,
+) -> None:
     """Gets designated image data from an image file, in the form of a
         designated rectangle.
     Returns uncompressed results for JPEGs and processed results
@@ -489,8 +490,8 @@ def GetImage(
     :param Dict[str, Dict[str, int]] source_rect: Designate the coordinates
         and size of the rectangle to be retrieved from the source image.
     :param Dict[str, int] dest_size: Designate the rectangle size for output.
+    :param EdsObject stream: The memory or file stream for output of the image.
     :raises EdsError: Any of the sdk errors.
-    :return EdsObject: the memory or file stream for output of the image.
     """
     ...
 

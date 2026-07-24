@@ -1902,24 +1902,25 @@ PyDoc_STRVAR(PyEds_DownloadThumbnail__doc__,
 "\tto the host computer.\n"
 "Downloaded thumbnails are sent directly to a file stream created in advance.\n\n"
 ":param EdsObject dir_item: The directory item.\n"
-":raises EdsError: Any of the sdk errors.\n"
-":return EdsObject: The stream.\n");
+":param EdsObject stream: The memory or file stream for the thumbnail.\n"
+":raises EdsError: Any of the sdk errors.\n");
 
 static PyObject* PyEds_DownloadThumbnail(PyObject *Py_UNUSED(self), PyObject *args) {
     PyObject *pyDirItemRef;
-    PyObject *pyFileStream;
-    if (!PyArg_ParseTuple(args, "OkO:EdsDownloadThumbnail", &pyDirItemRef, &pyFileStream)) {
+    PyObject *pyStream;
+    if (!PyArg_ParseTuple(
+            args, "OO:DownloadThumbnail", &pyDirItemRef, &pyStream)) {
         return nullptr;
     }
     PyEdsObject* dirItem(PyToEds(pyDirItemRef));
     if (dirItem == nullptr) {
         return nullptr;
     }
-    PyEdsObject* fileStream(PyToEds(pyFileStream));
-    if (fileStream == nullptr) {
+    PyEdsObject* stream(PyToEds(pyStream));
+    if (stream == nullptr) {
         return nullptr;
     }
-    unsigned long retVal(EdsDownloadThumbnail(dirItem->edsObj, fileStream->edsObj));
+    unsigned long retVal(EdsDownloadThumbnail(dirItem->edsObj, stream->edsObj));
     PyCheck_EDSERROR(retVal);
 
     Py_RETURN_NONE;
@@ -2405,8 +2406,8 @@ PyDoc_STRVAR(PyEds_GetImage__doc__,
 ":param Dict[str, Dict[str, int]] source_rect: Designate the coordinates\n"
 "\tand size of the rectangle to be retrieved from the source image.\n"
 ":param Dict[str, int] dest_size: Designate the rectangle size for output.\n"
-":raises EdsError: Any of the sdk errors.\n"
-":return EdsObject: the memory or file stream for output of the image.");
+":param EdsObject stream: The memory or file stream for output of the image.\n"
+":raises EdsError: Any of the sdk errors.");
 
 static PyObject* PyEds_GetImage(PyObject *Py_UNUSED(self), PyObject *args){
     PyObject *pyImage;
@@ -2414,34 +2415,43 @@ static PyObject* PyEds_GetImage(PyObject *Py_UNUSED(self), PyObject *args){
     unsigned long imageType;
     PyObject *pySourceRect;
     PyObject *pyDestSize;
+    PyObject *pyStream;
 
     if (!PyArg_ParseTuple(
-            args, "OKKOO:GetImage", &pyImage, &imageSource, &imageType,
-            &PyDict_Type, &pySourceRect, &PyDict_Type, &pyDestSize)) {
+            args, "OkkO!O!O:GetImage",
+            &pyImage,
+            &imageSource,
+            &imageType,
+            &PyDict_Type,
+            &pySourceRect,
+            &PyDict_Type,
+            &pyDestSize,
+            &pyStream)) {
         return nullptr;
     }
 
-    PyEdsObject *pyEdsObject(PyToEds(pyImage));
+    PyEdsObject *image(PyToEds(pyImage));
     EdsRect sourceRect;
     EdsSize destSize;
-    EdsStreamRef streamRef(nullptr);
 
-    if (pyEdsObject == nullptr ||
+    if (image == nullptr ||
             !EDS::PyDict_ToEdsRect(pySourceRect, sourceRect) ||
             !EDS::PyDict_ToEdsSize(pyDestSize, destSize)) {
         return nullptr;
     }
+    PyEdsObject *stream(PyToEds(pyStream));
+    if (stream == nullptr) {
+        return nullptr;
+    }
 
     unsigned long retVal(EdsGetImage(
-        pyEdsObject->edsObj,
+        image->edsObj,
         static_cast<EdsImageSource>(imageSource),
         static_cast<EdsTargetImageType>(imageType),
-        sourceRect, destSize, streamRef));
+        sourceRect, destSize, stream->edsObj));
     PyCheck_EDSERROR(retVal);
 
-    PyObject *pyStream = PyEdsObject_New(streamRef);
-    assert(pyStream);
-    return pyStream;
+    Py_RETURN_NONE;
 }
 
 
