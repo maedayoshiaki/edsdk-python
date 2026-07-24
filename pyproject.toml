@@ -41,6 +41,7 @@ dependencies = [
 [project.optional-dependencies]
 examples = [
   "numpy>=1.24",
+  "imageio>=2.34",
   "opencv-python>=4.9",
   "Pillow>=10.0",
   "rawpy>=0.21.0",
@@ -49,6 +50,7 @@ dev = [
   "pytest>=7.4",
   "mypy>=1.8",
   "black>=23.12",
+  "tomli>=2.0.1; python_version < '3.11'",
 ]
 
 [tool.setuptools]

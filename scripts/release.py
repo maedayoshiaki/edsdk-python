@@ -22,10 +22,14 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import tomllib
 import zipfile
 from collections.abc import Sequence
 from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.8-3.10
+    import tomli as tomllib
 
 DEFAULT_REPO = "maedayoshiaki/edsdk-python"
 DEFAULT_PYTHONS = ("3.11", "3.12", "3.13")
@@ -133,7 +137,9 @@ def forbidden_wheel_entries(wheel_path: Path) -> list[str]:
     with zipfile.ZipFile(wheel_path) as zf:
         for name in zf.namelist():
             basename = Path(name).name
-            if basename.lower().endswith(".dll") or _FORBIDDEN_BASENAME_RE.match(basename):
+            if basename.lower().endswith(".dll") or _FORBIDDEN_BASENAME_RE.match(
+                basename
+            ):
                 forbidden.append(name)
     return forbidden
 
@@ -320,7 +326,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if git_output(repo_root, "tag", "-l", f"v{version}"):
             print(f"ERROR: tag v{version} already exists locally", file=sys.stderr)
             return 1
-        if git_output(repo_root, "ls-remote", "--tags", "origin", f"refs/tags/v{version}"):
+        if git_output(
+            repo_root, "ls-remote", "--tags", "origin", f"refs/tags/v{version}"
+        ):
             print(f"ERROR: tag v{version} already exists on origin", file=sys.stderr)
             return 1
         remote_version = remote_main_version(repo_root)
@@ -384,7 +392,10 @@ if __name__ == "__main__":
         sys.exit(main())
     except subprocess.CalledProcessError as exc:
         cmd = " ".join(str(part) for part in exc.cmd)
-        print(f"ERROR: command failed with exit code {exc.returncode}: {cmd}", file=sys.stderr)
+        print(
+            f"ERROR: command failed with exit code {exc.returncode}: {cmd}",
+            file=sys.stderr,
+        )
         if exc.stderr:
             print(exc.stderr, file=sys.stderr)
         if exc.stdout:

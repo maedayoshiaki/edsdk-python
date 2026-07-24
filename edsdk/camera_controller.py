@@ -1358,7 +1358,9 @@ class CameraController:
                     if iio is None:
                         raise RuntimeError(
                             "imageio (imageio.v3) is required to decode JPEG/HEIF "
-                            "for capture_numpy(). Install via 'pip install imageio'."
+                            "for capture_numpy(). Install via "
+                            "'pip install edsdk-python[examples]' or "
+                            "'pip install imageio'."
                         ) from imageio_import_error
                     self._log(
                         f"Loading image with imageio -> numpy: {os.path.basename(p)}"

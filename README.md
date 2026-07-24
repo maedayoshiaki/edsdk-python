@@ -271,4 +271,7 @@ If you see errors like:
     Follow [Modify EDSDKTypes.h](#modify-edsdktypesh).
 
 - "OpenCV (cv2) not found" when running examples
-    Install extras: `pip install edsdk-python[display]` or `pip install -r requirements-examples.txt`.
+    Install extras: `pip install edsdk-python[examples]` or `pip install -r requirements-examples.txt`.
+
+- "imageio (imageio.v3) is required" when using `capture_numpy()`
+    Install extras: `pip install edsdk-python[examples]` or install `imageio` directly.

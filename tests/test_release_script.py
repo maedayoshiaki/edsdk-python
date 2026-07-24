@@ -1,15 +1,38 @@
 """Unit tests for scripts/release.py pure helpers (no camera/SDK required)."""
 
 import sys
-import tomllib
 import zipfile
 from pathlib import Path
 
 import pytest
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.8-3.10
+    import tomli as tomllib
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import release  # noqa: E402
+
+
+class TestOptionalDependencies:
+    @staticmethod
+    def _project():
+        pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
+        return tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]
+
+    def test_examples_extra_includes_capture_numpy_decoder(self):
+        examples = self._project()["optional-dependencies"]["examples"]
+        assert any(requirement.startswith("imageio>=") for requirement in examples)
+
+    def test_python_310_dev_extra_includes_tomllib_backport(self):
+        dev = self._project()["optional-dependencies"]["dev"]
+        assert any(
+            requirement.startswith("tomli>=")
+            and "python_version < '3.11'" in requirement
+            for requirement in dev
+        )
 
 
 class TestParseProjectVersion:
@@ -68,7 +91,10 @@ class TestReleaseNotes:
             "maedayoshiaki/edsdk-python", "0.1.7", ["3.11", "3.12", "3.13"]
         )
         for python in ("3.11", "3.12", "3.13"):
-            assert release.wheel_url("maedayoshiaki/edsdk-python", "0.1.7", python) in notes
+            assert (
+                release.wheel_url("maedayoshiaki/edsdk-python", "0.1.7", python)
+                in notes
+            )
         assert "EDSDK_PYTHON_DLL_DIR" in notes
         # Canon の SDK を同梱しない旨の明示
         assert "NOT included" in notes
