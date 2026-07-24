@@ -131,6 +131,11 @@ def _display_with_tk(cam: CameraController, args) -> None:
 def main(argv: Optional[list[str]] = None) -> int:
     p = argparse.ArgumentParser(description="Canon EDSDK live view")
     p.add_argument("--index", type=int, default=0, help="Camera index (default: 0)")
+    p.add_argument(
+        "--protected",
+        action="store_true",
+        help="Run the EDSDK session in a worker process resilient to parent termination",
+    )
     p.add_argument("--save-dir", default=".", help="Directory to save frames")
     p.add_argument("--prefix", default="evf_", help="Filename prefix")
     p.add_argument("--verbose", action="store_true", help="Verbose logging")
@@ -167,7 +172,10 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     try:
         with CameraController(
-            index=args.index, save_dir=args.save_dir, verbose=args.verbose
+            index=args.index,
+            save_dir=args.save_dir,
+            verbose=args.verbose,
+            protected=args.protected,
         ) as cam:
             cam.start_live_view()
 

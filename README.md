@@ -199,6 +199,48 @@ an exact value. Pass `nearest=True` to snap automatically (matching is
 done in EV / log2 space). `Bulb` and ISO `Auto` are never chosen by
 `nearest`; request them explicitly (`"bulb"` / `"auto"`).
 
+## Safe shutdown and protected camera sessions
+
+`CameraController.close()` is idempotent and is also called by the context
+manager and during normal interpreter shutdown. If opening a camera fails
+halfway through, the controller still attempts to close the session and
+terminate EDSDK.
+
+On Windows, opt into a separate EDSDK worker when the application process may
+be force-terminated:
+
+```python
+from edsdk.camera_controller import CameraController
+
+with CameraController(protected=True, save_dir="out") as cam:
+    cam.set_tv("1/125")
+    paths = cam.capture()
+```
+
+The worker owns the EDSDK session. If only the parent application is terminated
+with `taskkill /F`, `Popen.kill()`, or an equivalent `TerminateProcess` call,
+the worker detects the broken control pipe and closes the camera session before
+exiting. Do not use `taskkill /T /F`: killing the worker itself prevents any
+software cleanup. A permanently blocked EDSDK call must return before the
+worker can close the session.
+
+Protected mode supports property/exposure operations, capture to paths or
+bytes, NumPy/RAW processing, profiles, and live view. RAW processors and NumPy
+conversion run in the parent process. Native `EdsObject` values cannot cross
+the process boundary, so use serializable events instead of `on_object()` or
+`on_property()`:
+
+```python
+with CameraController(protected=True) as cam:
+    cam.on_event(lambda event: print(event))
+    cam.capture()
+```
+
+`on_event()` receives dictionaries containing `kind`, `event`, and optional
+`path`, `property`, and `param` fields. In protected mode the callback runs on
+the parent-side IPC receiver thread; keep it short or forward work to another
+thread/async queue. `enable_async()` receives the same events.
+
 ## Troubleshooting
 
 If you see errors like:

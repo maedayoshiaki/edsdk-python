@@ -46,13 +46,21 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="Do not validate property values against camera supported list",
     )
     p.add_argument("--verbose", action="store_true", help="Verbose logging")
+    p.add_argument(
+        "--protected",
+        action="store_true",
+        help="Run the EDSDK session in a worker process resilient to parent termination",
+    )
     args = p.parse_args(argv)
 
     os.makedirs(args.save_dir, exist_ok=True)
 
     try:
         with CameraController(
-            index=args.index, save_dir=args.save_dir, verbose=args.verbose
+            index=args.index,
+            save_dir=args.save_dir,
+            verbose=args.verbose,
+            protected=args.protected,
         ) as cam:
             if args.list:
                 supported = cam.list_supported()

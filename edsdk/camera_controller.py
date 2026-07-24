@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import os
 import json
 import io
@@ -7,6 +8,7 @@ import asyncio
 import time
 import uuid
 import inspect
+from enum import IntEnum
 from typing import (
     Callable,
     Dict,
@@ -17,12 +19,14 @@ from typing import (
     Union,
     TYPE_CHECKING,
     Type,
+    TypedDict,
     runtime_checkable,
 )
 
 # Only imported for type checking to avoid runtime cost if deps not installed
 if TYPE_CHECKING:  # pragma: no cover
     import numpy as np
+    from edsdk._camera_ipc import ProtectedWorkerClient
 
 
 # External SDK imports
@@ -68,6 +72,40 @@ from edsdk.exposure import (
 ObjectCallback = Callable[["ObjectEvent", "EdsObject"], int]
 PropertyCallback = Callable[["PropertyEvent", "PropID", int], int]
 LiveViewData = Union[bytes, str]
+
+
+class CameraEvent(TypedDict, total=False):
+    """Serializable camera event used by direct and protected controllers."""
+
+    kind: str
+    event: Union[str, int]
+    path: str
+    property: Union[str, int]
+    param: int
+
+
+EventCallback = Callable[[CameraEvent], None]
+
+
+class CameraCleanupError(RuntimeError):
+    """Raised after every cleanup stage has been attempted."""
+
+    def __init__(self, errors: List[Tuple[str, BaseException]]) -> None:
+        self.errors = tuple(errors)
+        details = "; ".join(f"{stage}: {exc}" for stage, exc in errors)
+        super().__init__(f"Camera cleanup failed ({details})")
+
+
+class CameraWorkerError(RuntimeError):
+    """Raised when the protected camera worker cannot complete a request."""
+
+    def __init__(self, message: str, *, code: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class CameraWorkerTimeoutError(CameraWorkerError, TimeoutError):
+    """Raised when protected worker startup or shutdown times out."""
 
 
 @runtime_checkable
@@ -265,7 +303,14 @@ class CameraController:
         register_property_events: bool = True,
         file_pattern: Optional[str] = None,
         seq_start: int = 1,
+        protected: bool = False,
+        worker_start_timeout: float = 10.0,
+        worker_shutdown_timeout: float = 5.0,
     ) -> None:
+        if worker_start_timeout <= 0:
+            raise ValueError("worker_start_timeout must be greater than zero")
+        if worker_shutdown_timeout <= 0:
+            raise ValueError("worker_shutdown_timeout must be greater than zero")
         self.index = index
         self.save_dir = save_dir
         self.save_to = save_to
@@ -276,9 +321,10 @@ class CameraController:
         self._saved_paths: List[str] = []
         self._obj_cb: Optional[ObjectCallback] = None
         self._prop_cb: Optional[PropertyCallback] = None
+        self._event_cb: Optional[EventCallback] = None
         self._live_view_on: bool = False
         # asyncio event queue support
-        self._async_queue: Optional[asyncio.Queue[Dict[str, Union[str, int]]]] = None
+        self._async_queue: Optional[asyncio.Queue[CameraEvent]] = None
         self._async_loop: Optional[asyncio.AbstractEventLoop] = None
         self._async_pumping: bool = False
         self._register_property_events = register_property_events
@@ -286,70 +332,220 @@ class CameraController:
         self._seq = int(seq_start)
         # One-shot explicit filename (base name); if set, next capture uses this name
         self._next_filename: Optional[str] = None
+        self.protected = bool(protected)
+        self.worker_start_timeout = float(worker_start_timeout)
+        self.worker_shutdown_timeout = float(worker_shutdown_timeout)
+        self._worker: Optional["ProtectedWorkerClient"] = None
+        self._sdk_initialized = False
+        self._session_open = False
+        self._entered = False
+        self._atexit_registered = False
 
     # ---------- Lifecycle ----------
     def __enter__(self) -> "CameraController":
-        edsdk.InitializeSDK()
-        cam_list = edsdk.GetCameraList()
-        nr_cameras = edsdk.GetChildCount(cam_list)
-        if nr_cameras == 0:
-            self.__exit__(None, None, None)
-            raise RuntimeError("No cameras connected")
-        if self.index >= nr_cameras:
-            self.__exit__(None, None, None)
-            raise RuntimeError(
-                f"Camera index {self.index} out of range (found {nr_cameras})"
-            )
-        cam = edsdk.GetChildAtIndex(cam_list, self.index)
-        edsdk.OpenSession(cam)
+        if self._entered:
+            raise RuntimeError("Camera session is already open")
 
-        # Event handlers (property event can be suppressed to avoid noisy warnings)
-        edsdk.SetObjectEventHandler(cam, ObjectEvent.All, self._on_object_event)
-        if self._register_property_events:
+        if self.protected:
+            return self._enter_protected()
+
+        try:
+            edsdk.InitializeSDK()
+            self._sdk_initialized = True
+            self._register_atexit()
+            cam_list = edsdk.GetCameraList()
             try:
-                edsdk.SetPropertyEventHandler(
-                    cam, PropertyEvent.All, self._on_property_event
-                )
-            except Exception as e:
-                # Non-fatal: log only if verbose
-                self._log(f"Skip property events: {e}")
+                nr_cameras = edsdk.GetChildCount(cam_list)
+                if nr_cameras == 0:
+                    raise RuntimeError("No cameras connected")
+                if self.index >= nr_cameras:
+                    raise RuntimeError(
+                        f"Camera index {self.index} out of range (found {nr_cameras})"
+                    )
+                cam = edsdk.GetChildAtIndex(cam_list, self.index)
+            finally:
+                del cam_list
+            self._cam = cam
+            edsdk.OpenSession(cam)
+            self._session_open = True
 
-        # Save to host and capacity
-        edsdk.SetPropertyData(cam, PropID.SaveTo, 0, int(self.save_to))
-        if self.auto_capacity:
-            edsdk.SetCapacity(
-                cam,
-                {
-                    "reset": True,
-                    "bytesPerSector": 512,
-                    "numberOfFreeClusters": 2_147_483_647,
-                },
-            )
-        self._cam = cam
-        self._log("Camera session opened")
-        return self
+            # Event handlers (property event can be suppressed to avoid noisy warnings)
+            edsdk.SetObjectEventHandler(cam, ObjectEvent.All, self._on_object_event)
+            if self._register_property_events:
+                try:
+                    edsdk.SetPropertyEventHandler(
+                        cam, PropertyEvent.All, self._on_property_event
+                    )
+                except Exception as e:
+                    # Non-fatal: log only if verbose
+                    self._log(f"Skip property events: {e}")
+
+            # Save to host and capacity
+            edsdk.SetPropertyData(cam, PropID.SaveTo, 0, int(self.save_to))
+            if self.auto_capacity:
+                edsdk.SetCapacity(
+                    cam,
+                    {
+                        "reset": True,
+                        "bytesPerSector": 512,
+                        "numberOfFreeClusters": 2_147_483_647,
+                    },
+                )
+            self._entered = True
+            self._log("Camera session opened")
+            return self
+        except BaseException:
+            self._close_after_failure()
+            raise
 
     def __exit__(self, exc_type, exc, tb) -> None:
         try:
-            if self._cam is not None:
-                try:
-                    edsdk.CloseSession(self._cam)
-                except Exception:
-                    pass
-        finally:
+            self.close()
+        except Exception as cleanup_exc:
+            if exc_type is None:
+                raise
+            self._log(
+                f"Camera cleanup failed while handling {exc_type.__name__}: {cleanup_exc}"
+            )
+
+    def _enter_protected(self) -> "CameraController":
+        if os.name != "nt":
+            raise RuntimeError("protected=True is currently supported only on Windows")
+        from edsdk._camera_ipc import ProtectedWorkerClient
+
+        config = {
+            "index": self.index,
+            "save_dir": os.path.abspath(self.save_dir),
+            "save_to": int(self.save_to),
+            "auto_capacity": self.auto_capacity,
+            "verbose": self.verbose,
+            "register_property_events": self._register_property_events,
+            "file_pattern": self._file_pattern,
+            "seq_start": self._seq,
+        }
+        worker = ProtectedWorkerClient(
+            config=config,
+            event_handler=self._receive_worker_event,
+            log_handler=self._log,
+            start_timeout=self.worker_start_timeout,
+            shutdown_timeout=self.worker_shutdown_timeout,
+        )
+        try:
+            worker.start()
+        except BaseException:
+            worker.abandon()
+            raise
+        self._worker = worker
+        self._entered = True
+        self._register_atexit()
+        self._log("Protected camera worker opened")
+        return self
+
+    def close(self) -> None:
+        """Close the camera session and SDK, safely and idempotently."""
+        if self.protected:
+            self._close_protected()
+            return
+
+        errors: List[Tuple[str, BaseException]] = []
+        cam = self._cam
+
+        if self._live_view_on and cam is not None:
+            try:
+                self._stop_live_view_direct(suppress_errors=False)
+            except BaseException as exc:
+                errors.append(("stop_live_view", exc))
+
+        if self._session_open and cam is not None:
+            try:
+                edsdk.CloseSession(cam)
+            except BaseException as exc:
+                errors.append(("close_session", exc))
+            finally:
+                self._session_open = False
+
+        # Drop the last camera reference before terminating the SDK so that
+        # PyEdsObject_dealloc calls EdsRelease while the SDK is still active.
+        self._cam = None
+        cam = None
+
+        if self._sdk_initialized:
             try:
                 edsdk.TerminateSDK()
-            except Exception:
-                pass
-        self._cam = None
-        self._log("Camera session closed")
+            except BaseException as exc:
+                errors.append(("terminate_sdk", exc))
+            else:
+                self._sdk_initialized = False
+
+        self._live_view_on = False
+        self._entered = False
+        if not self._sdk_initialized:
+            self._unregister_atexit()
+        if not errors:
+            self._log("Camera session closed")
+        else:
+            raise CameraCleanupError(errors)
+
+    def _close_protected(self) -> None:
+        worker = self._worker
+        self._worker = None
+        self._entered = False
+        self._live_view_on = False
+        self._unregister_atexit()
+        if worker is None:
+            return
+        try:
+            worker.close()
+            self._log("Protected camera worker closed")
+        except BaseException:
+            worker.abandon()
+            raise
+
+    def _close_after_failure(self) -> None:
+        try:
+            self.close()
+        except BaseException as cleanup_exc:
+            self._log(f"Camera cleanup after open failure also failed: {cleanup_exc}")
+
+    def _register_atexit(self) -> None:
+        if not self._atexit_registered:
+            atexit.register(self._close_at_exit)
+            self._atexit_registered = True
+
+    def _unregister_atexit(self) -> None:
+        if self._atexit_registered:
+            atexit.unregister(self._close_at_exit)
+            self._atexit_registered = False
+
+    def _close_at_exit(self) -> None:
+        try:
+            self.close()
+        except BaseException as exc:
+            self._log(f"Camera cleanup during interpreter shutdown failed: {exc}")
 
     # ---------- Event handlers ----------
     def on_object(self, fn: ObjectCallback) -> None:
+        if self.protected:
+            raise NotImplementedError(
+                "on_object() cannot transfer EdsObject across processes; use on_event()"
+            )
         self._obj_cb = fn
 
     def on_property(self, fn: PropertyCallback) -> None:
+        if self.protected:
+            raise NotImplementedError(
+                "on_property() is unavailable in protected mode; use on_event()"
+            )
         self._prop_cb = fn
+
+    def on_event(self, fn: EventCallback) -> None:
+        """Register a serializable event callback.
+
+        In protected mode the callback runs on the parent-side IPC receiver thread.
+        """
+        if not callable(fn):
+            raise TypeError("event callback must be callable")
+        self._event_cb = fn
 
     def _on_object_event(self, event: ObjectEvent, object_handle: EdsObject) -> int:
         if event == ObjectEvent.DirItemRequestTransfer:
@@ -405,9 +601,11 @@ class CameraController:
             self._enqueue_async_event(
                 {
                     "kind": "object",
-                    "event": getattr(ObjectEvent, event.name).name
-                    if hasattr(event, "name")
-                    else int(event),
+                    "event": (
+                        getattr(ObjectEvent, event.name).name
+                        if hasattr(event, "name")
+                        else int(event)
+                    ),
                 }
             )
         if self._obj_cb:
@@ -420,25 +618,25 @@ class CameraController:
     def _on_property_event(
         self, event: PropertyEvent, prop_id: PropID, param: int
     ) -> int:
-        if self._prop_cb:
-            try:
-                return int(self._prop_cb(event, prop_id, param))
-            except Exception:
-                return 0
-        # queue property event (coarse)
+        # Queue the serializable event even when a legacy callback is registered.
         try:
             self._enqueue_async_event(
                 {
                     "kind": "property",
                     "event": event.name if hasattr(event, "name") else int(event),
-                    "property": prop_id.name
-                    if hasattr(prop_id, "name")
-                    else int(prop_id),
+                    "property": (
+                        prop_id.name if hasattr(prop_id, "name") else int(prop_id)
+                    ),
                     "param": int(param),
                 }
             )
         except Exception:
             pass
+        if self._prop_cb:
+            try:
+                return int(self._prop_cb(event, prop_id, param))
+            except Exception:
+                return 0
         return 0
 
     # ---------- Properties ----------
@@ -460,6 +658,25 @@ class CameraController:
         validate: bool = True,
         tolerate_not_supported: bool = False,
     ) -> None:
+        if self.protected:
+            self._call_worker(
+                "set_properties",
+                av=av,
+                tv=tv,
+                iso=iso,
+                ae_mode=ae_mode,
+                metering=metering,
+                white_balance=white_balance,
+                image_quality=image_quality,
+                drive_mode=drive_mode,
+                manual_focus=manual_focus,
+                af_mode=af_mode,
+                evf_af_mode=evf_af_mode,
+                nearest=nearest,
+                validate=validate,
+                tolerate_not_supported=tolerate_not_supported,
+            )
+            return
         if self._cam is None:
             raise RuntimeError("Camera session not open")
         # Prepare desired values
@@ -472,7 +689,9 @@ class CameraController:
             to_set.append((PropID.Tv, resolve_tv(tv, codes, nearest=nearest).code))
         if iso is not None:
             codes = self._get_supported_codes(PropID.ISOSpeed) if validate else ()
-            to_set.append((PropID.ISOSpeed, resolve_iso(iso, codes, nearest=nearest).code))
+            to_set.append(
+                (PropID.ISOSpeed, resolve_iso(iso, codes, nearest=nearest).code)
+            )
         if ae_mode is not None:
             to_set.append((PropID.AEMode, _enum_code(AEMode, ae_mode)))
         if metering is not None:
@@ -528,6 +747,8 @@ class CameraController:
                 raise
 
     def get_properties(self) -> Dict[str, Union[str, int]]:
+        if self.protected:
+            return self._call_worker("get_properties")
         if self._cam is None:
             raise RuntimeError("Camera session not open")
         av_code = edsdk.GetPropertyData(self._cam, PropID.Av, 0)
@@ -578,22 +799,39 @@ class CameraController:
             raise RuntimeError("Camera session not open")
         return self._cam
 
+    def _ensure_open(self) -> None:
+        if self.protected:
+            if not self._entered or self._worker is None:
+                raise RuntimeError("Camera session not open")
+            return
+        self._require_session()
+
+    def _call_worker(self, method: str, *args, **kwargs):
+        worker = self._worker
+        if not self._entered or worker is None:
+            raise RuntimeError("Camera session not open")
+        return worker.call(method, *args, **kwargs)
+
     def get_av(self) -> Aperture:
         """Return the current aperture as an :class:`Aperture`."""
+        if self.protected:
+            return self._call_worker("get_av")
         cam = self._require_session()
         return Aperture.from_code(int(edsdk.GetPropertyData(cam, PropID.Av, 0)))
 
     def get_tv(self) -> ShutterSpeed:
         """Return the current shutter speed as a :class:`ShutterSpeed`."""
+        if self.protected:
+            return self._call_worker("get_tv")
         cam = self._require_session()
         return ShutterSpeed.from_code(int(edsdk.GetPropertyData(cam, PropID.Tv, 0)))
 
     def get_iso(self) -> ISOSpeed:
         """Return the current ISO as an :class:`ISOSpeed`."""
+        if self.protected:
+            return self._call_worker("get_iso")
         cam = self._require_session()
-        return ISOSpeed.from_code(
-            int(edsdk.GetPropertyData(cam, PropID.ISOSpeed, 0))
-        )
+        return ISOSpeed.from_code(int(edsdk.GetPropertyData(cam, PropID.ISOSpeed, 0)))
 
     def set_av(self, value: ApertureLike, *, nearest: bool = False) -> Aperture:
         """Set the aperture and return the value the camera reports back.
@@ -602,6 +840,8 @@ class CameraController:
             value: f-number (5.6), string ("f/5.6", "5.6"), or Aperture.
             nearest: Snap to the nearest supported value instead of raising.
         """
+        if self.protected:
+            return self._call_worker("set_av", value, nearest=nearest)
         cam = self._require_session()
         resolved = resolve_av(
             value, self._get_supported_codes(PropID.Av), nearest=nearest
@@ -617,6 +857,8 @@ class CameraController:
             value: seconds (0.008), string ("1/125", "0.5s", "bulb"), or ShutterSpeed.
             nearest: Snap to the nearest supported value instead of raising.
         """
+        if self.protected:
+            return self._call_worker("set_tv", value, nearest=nearest)
         cam = self._require_session()
         resolved = resolve_tv(
             value, self._get_supported_codes(PropID.Tv), nearest=nearest
@@ -632,6 +874,8 @@ class CameraController:
             value: ISO value (400, 0=Auto), string ("400", "auto"), or ISOSpeed.
             nearest: Snap to the nearest supported value instead of raising.
         """
+        if self.protected:
+            return self._call_worker("set_iso", value, nearest=nearest)
         cam = self._require_session()
         resolved = resolve_iso(
             value, self._get_supported_codes(PropID.ISOSpeed), nearest=nearest
@@ -642,20 +886,28 @@ class CameraController:
 
     def supported_av(self) -> List[Aperture]:
         """Apertures supported by the connected camera/lens."""
+        if self.protected:
+            return self._call_worker("supported_av")
         self._require_session()
         return self._supported_entries(PropID.Av, Aperture.from_code)
 
     def supported_tv(self) -> List[ShutterSpeed]:
         """Shutter speeds supported by the connected camera."""
+        if self.protected:
+            return self._call_worker("supported_tv")
         self._require_session()
         return self._supported_entries(PropID.Tv, ShutterSpeed.from_code)
 
     def supported_iso(self) -> List[ISOSpeed]:
         """ISO speeds supported by the connected camera."""
+        if self.protected:
+            return self._call_worker("supported_iso")
         self._require_session()
         return self._supported_entries(PropID.ISOSpeed, ISOSpeed.from_code)
 
-    def _supported_entries(self, pid: PropID, from_code: Callable[[int], object]) -> List:
+    def _supported_entries(
+        self, pid: PropID, from_code: Callable[[int], object]
+    ) -> List:
         entries: List = []
         for code in self._get_supported_codes(pid):
             try:
@@ -699,6 +951,8 @@ class CameraController:
 
     # ---------- Supported candidates ----------
     def list_supported(self) -> Dict[str, List[str]]:
+        if self.protected:
+            return self._call_worker("list_supported")
         if self._cam is None:
             raise RuntimeError("Camera session not open")
         return {
@@ -745,7 +999,7 @@ class CameraController:
 
     def _get_supported_codes(self, pid: PropID) -> List[int]:
         try:
-            desc = edsdk.GetPropertyDesc(self._cam, pid)
+            desc = edsdk.GetPropertyDesc(self._require_session(), pid)
             return list(desc.get("propDesc", ()))
         except Exception:
             return []
@@ -753,6 +1007,8 @@ class CameraController:
     # ---------- ImageQuality helpers ----------
     def get_image_quality_code(self) -> int:
         """Return current ImageQuality property code."""
+        if self.protected:
+            return int(self._call_worker("get_image_quality_code"))
         if self._cam is None:
             raise RuntimeError("Camera session not open")
         return int(edsdk.GetPropertyData(self._cam, PropID.ImageQuality, 0))
@@ -776,6 +1032,16 @@ class CameraController:
         retry_delay: float = 0.3,
         filename: Optional[str] = None,
     ) -> List[str]:
+        if self.protected:
+            return self._call_worker(
+                "capture",
+                shots,
+                timeout,
+                interval=interval,
+                retry=retry,
+                retry_delay=retry_delay,
+                filename=filename,
+            )
         if self._cam is None:
             raise RuntimeError("Camera session not open")
         self._saved_paths.clear()
@@ -894,13 +1160,12 @@ class CameraController:
             # RAW のみを raw_processor で処理するモードなら許容し、
             # JPEG/HEIF を含む場合に備えて明示的なエラーメッセージを出す
             iio = None  # type: ignore[assignment]
-            imageio_import_error = e
+            imageio_import_error: Optional[Exception] = e
         else:
             imageio_import_error = None
 
         # Check current ImageQuality setting before capture
-        if self._cam is None:
-            raise RuntimeError("Camera session not open")
+        self._ensure_open()
 
         quality_code = self.get_image_quality_code()
         includes_raw = _image_quality_includes_raw(quality_code)
@@ -990,6 +1255,10 @@ class CameraController:
 
     # ---------- Live View ----------
     def start_live_view(self) -> None:
+        if self.protected:
+            self._call_worker("start_live_view")
+            self._live_view_on = True
+            return
         if self._cam is None:
             raise RuntimeError("Camera session not open")
         # Enable LV to PC
@@ -1001,19 +1270,40 @@ class CameraController:
         self._log("Live view started")
 
     def stop_live_view(self) -> None:
+        if self.protected:
+            if self._worker is not None and self._entered:
+                self._call_worker("stop_live_view")
+            self._live_view_on = False
+            return
         if self._cam is None:
             return
+        self._stop_live_view_direct(suppress_errors=True)
+
+    def _stop_live_view_direct(self, *, suppress_errors: bool) -> None:
+        if self._cam is None:
+            self._live_view_on = False
+            return
+        errors: List[Tuple[str, BaseException]] = []
         try:
             edsdk.SetPropertyData(
                 self._cam, PropID.Evf_OutputDevice, 0, int(EvfOutputDevice.TFT)
             )
+        except BaseException as exc:
+            errors.append(("evf_output_device", exc))
+        try:
             edsdk.SetPropertyData(self._cam, PropID.Evf_Mode, 0, int(0))
-        except Exception:
-            pass
+        except BaseException as exc:
+            errors.append(("evf_mode", exc))
         self._live_view_on = False
         self._log("Live view stopped")
+        if errors and not suppress_errors:
+            raise CameraCleanupError(errors)
 
     def grab_live_view_frame(self, save_path: Optional[str] = None) -> LiveViewData:
+        if self.protected:
+            result = self._call_worker("grab_live_view_frame", save_path=save_path)
+            self._live_view_on = True
+            return result
         if self._cam is None:
             raise RuntimeError("Camera session not open")
         if not self._live_view_on:
@@ -1142,7 +1432,7 @@ class CameraController:
     # ---------- asyncio event queue ----------
     def enable_async(
         self, loop: Optional[asyncio.AbstractEventLoop] = None
-    ) -> asyncio.Queue:
+    ) -> asyncio.Queue[CameraEvent]:
         """Enable async event queue; returns asyncio.Queue for events."""
         if loop is None:
             loop = asyncio.get_event_loop()
@@ -1167,7 +1457,15 @@ class CameraController:
         finally:
             self._async_pumping = False
 
-    def _enqueue_async_event(self, evt: Dict[str, Union[str, int]]) -> None:
+    def _receive_worker_event(self, evt: CameraEvent) -> None:
+        self._enqueue_async_event(evt)
+
+    def _enqueue_async_event(self, evt: CameraEvent) -> None:
+        if self._event_cb is not None:
+            try:
+                self._event_cb(evt)
+            except Exception as exc:
+                self._log(f"Camera event callback failed: {exc}")
         if self._async_queue is None or self._async_loop is None:
             return
         try:
@@ -1212,7 +1510,7 @@ def classify_error(exc: Exception) -> Dict[str, Union[int, str, None]]:
     return {"message": str(exc)}
 
 
-def _enum_code(enum_cls: Type[object], value: Union[str, int]) -> int:
+def _enum_code(enum_cls: Type[IntEnum], value: Union[str, int]) -> int:
     if isinstance(value, int):
         return int(value)
     key = str(value).strip()
@@ -1245,7 +1543,7 @@ def _enum_code(enum_cls: Type[object], value: Union[str, int]) -> int:
 
 
 def _enum_supported_names(
-    pid: _PropIDEnum, enum_cls: Type[object], codes: List[int]
+    pid: _PropIDEnum, enum_cls: Type[IntEnum], codes: List[int]
 ) -> List[str]:
     names: List[str] = []
     if not codes:
