@@ -4,12 +4,14 @@
 #include "EDSDK.h"
 #include "edsdk_utils.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstring>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <vector>
 
 
 typedef struct {
@@ -60,11 +62,6 @@ static PyTypeObject PyEdsObjectType = {
 
 
 static PyObject *PyEdsError;
-static PyObject *pyProgressCallback[2] = {nullptr, nullptr};
-static PyObject *pyCameraAddedCallback[2] = {nullptr, nullptr};
-static PyObject *pySetPropertyCallback[2] = {nullptr, nullptr};
-static PyObject *pySetObjectCallback[2] = {nullptr, nullptr};
-static PyObject *pySetCameraStateCallback[2] = {nullptr, nullptr};
 
 
 struct PyObjectDeleter {
@@ -76,6 +73,84 @@ struct PyObjectDeleter {
 
 
 using OwnedPyObject = std::unique_ptr<PyObject, PyObjectDeleter>;
+
+
+class PythonGILGuard {
+public:
+    PythonGILGuard()
+        : state_(PyGILState_Ensure())
+    {
+    }
+
+    ~PythonGILGuard()
+    {
+        PyGILState_Release(state_);
+    }
+
+    PythonGILGuard(const PythonGILGuard &) = delete;
+    PythonGILGuard &operator=(const PythonGILGuard &) = delete;
+
+private:
+    PyGILState_STATE state_;
+};
+
+
+struct PythonCallbackContext {
+    PyObject *callable;
+    PyObject *context;
+};
+
+
+static std::vector<PythonCallbackContext *> pythonCallbackContexts;
+
+
+static void DestroyPythonCallbackContext(PythonCallbackContext *context)
+{
+    if (context == nullptr) {
+        return;
+    }
+    Py_XDECREF(context->callable);
+    Py_XDECREF(context->context);
+    delete context;
+}
+
+
+static PythonCallbackContext *CreatePythonCallbackContext(
+        PyObject *callable,
+        PyObject *context)
+{
+    PythonCallbackContext *callbackContext =
+        new (std::nothrow) PythonCallbackContext{callable, context};
+    if (callbackContext == nullptr) {
+        PyErr_NoMemory();
+        return nullptr;
+    }
+
+    Py_INCREF(callable);
+    Py_XINCREF(context);
+    try {
+        pythonCallbackContexts.push_back(callbackContext);
+    }
+    catch (const std::bad_alloc &) {
+        DestroyPythonCallbackContext(callbackContext);
+        PyErr_NoMemory();
+        return nullptr;
+    }
+    return callbackContext;
+}
+
+
+static void RemovePythonCallbackContext(PythonCallbackContext *context)
+{
+    const auto position = std::find(
+        pythonCallbackContexts.begin(),
+        pythonCallbackContexts.end(),
+        context);
+    if (position != pythonCallbackContexts.end()) {
+        pythonCallbackContexts.erase(position);
+    }
+    DestroyPythonCallbackContext(context);
+}
 
 
 static bool SetOwnedDictItem(
@@ -195,14 +270,12 @@ static bool PyLongToSignedProperty(
 }
 
 
-static void ClearPythonCallbackReferences()
+static void ClearPythonCallbackContexts()
 {
-    for (int i = 0; i < 2; ++i) {
-        Py_CLEAR(pyProgressCallback[i]);
-        Py_CLEAR(pyCameraAddedCallback[i]);
-        Py_CLEAR(pySetPropertyCallback[i]);
-        Py_CLEAR(pySetObjectCallback[i]);
-        Py_CLEAR(pySetCameraStateCallback[i]);
+    while (!pythonCallbackContexts.empty()) {
+        PythonCallbackContext *context = pythonCallbackContexts.back();
+        pythonCallbackContexts.pop_back();
+        DestroyPythonCallbackContext(context);
     }
 }
 
@@ -343,6 +416,201 @@ inline PyObject* GetEnum(const char* moduleName, const char* enumClassName, cons
 }
 
 
+static EdsError ReportPythonCallbackError(
+        PythonCallbackContext *callbackContext)
+{
+    if (!PyErr_Occurred()) {
+        PyErr_SetString(PyExc_RuntimeError, "Python callback failed");
+    }
+    PyErr_WriteUnraisable(
+        callbackContext == nullptr
+            ? Py_None
+            : callbackContext->callable);
+    return EDS_ERR_INVALID_FN_POINTER;
+}
+
+
+static EdsError PythonCallbackResult(
+        PyObject *result,
+        PythonCallbackContext *callbackContext)
+{
+    OwnedPyObject ownedResult(result);
+    if (!ownedResult) {
+        return ReportPythonCallbackError(callbackContext);
+    }
+
+    if (!PyLong_Check(ownedResult.get())) {
+        return EDS_ERR_OK;
+    }
+    const unsigned long returnCode =
+        PyLong_AsUnsignedLong(ownedResult.get());
+    if (PyErr_Occurred()) {
+        return ReportPythonCallbackError(callbackContext);
+    }
+    return static_cast<EdsError>(returnCode);
+}
+
+
+static EdsError EDSCALLBACK ProgressCallbackWrapper(
+        EdsUInt32 inPercent,
+        EdsVoid *inContext,
+        EdsBool *outCancel)
+{
+    PythonGILGuard gil;
+    PythonCallbackContext *callbackContext =
+        static_cast<PythonCallbackContext *>(inContext);
+    OwnedPyObject pyPercent(PyLong_FromUnsignedLong(inPercent));
+    OwnedPyObject pyCancel(
+        PyBool_FromLong(outCancel != nullptr && *outCancel));
+    if (!pyPercent || !pyCancel) {
+        return ReportPythonCallbackError(callbackContext);
+    }
+
+    PyObject *result = callbackContext->context == nullptr
+        ? PyObject_CallFunctionObjArgs(
+            callbackContext->callable,
+            pyPercent.get(),
+            pyCancel.get(),
+            nullptr)
+        : PyObject_CallFunctionObjArgs(
+            callbackContext->callable,
+            pyPercent.get(),
+            pyCancel.get(),
+            callbackContext->context,
+            nullptr);
+    return PythonCallbackResult(result, callbackContext);
+}
+
+
+static EdsError EDSCALLBACK CameraAddedCallbackWrapper(EdsVoid *inContext)
+{
+    PythonGILGuard gil;
+    PythonCallbackContext *callbackContext =
+        static_cast<PythonCallbackContext *>(inContext);
+    PyObject *result = callbackContext->context == nullptr
+        ? PyObject_CallFunctionObjArgs(callbackContext->callable, nullptr)
+        : PyObject_CallFunctionObjArgs(
+            callbackContext->callable,
+            callbackContext->context,
+            nullptr);
+    return PythonCallbackResult(result, callbackContext);
+}
+
+
+static EdsError EDSCALLBACK PropertyEventCallbackWrapper(
+        EdsPropertyEvent inEvent,
+        EdsPropertyID inPropertyID,
+        EdsUInt32 inParam,
+        EdsVoid *inContext)
+{
+    PythonGILGuard gil;
+    PythonCallbackContext *callbackContext =
+        static_cast<PythonCallbackContext *>(inContext);
+    OwnedPyObject pyEvent(
+        GetEnum("edsdk.constants", "PropertyEvent", inEvent));
+    if (!pyEvent) {
+        PyErr_Clear();
+        pyEvent.reset(PyLong_FromUnsignedLong(inEvent));
+    }
+    OwnedPyObject pyPropertyID(
+        GetEnum("edsdk.constants", "PropID", inPropertyID));
+    if (!pyPropertyID) {
+        PyErr_Clear();
+        pyPropertyID.reset(PyLong_FromUnsignedLong(inPropertyID));
+    }
+    OwnedPyObject pyParam(PyLong_FromUnsignedLong(inParam));
+    if (!pyEvent || !pyPropertyID || !pyParam) {
+        return ReportPythonCallbackError(callbackContext);
+    }
+
+    PyObject *result = callbackContext->context == nullptr
+        ? PyObject_CallFunctionObjArgs(
+            callbackContext->callable,
+            pyEvent.get(),
+            pyPropertyID.get(),
+            pyParam.get(),
+            nullptr)
+        : PyObject_CallFunctionObjArgs(
+            callbackContext->callable,
+            pyEvent.get(),
+            pyPropertyID.get(),
+            pyParam.get(),
+            callbackContext->context,
+            nullptr);
+    return PythonCallbackResult(result, callbackContext);
+}
+
+
+static EdsError EDSCALLBACK ObjectEventCallbackWrapper(
+        EdsObjectEvent inEvent,
+        EdsBaseRef inRef,
+        EdsVoid *inContext)
+{
+    PythonGILGuard gil;
+    PythonCallbackContext *callbackContext =
+        static_cast<PythonCallbackContext *>(inContext);
+    OwnedPyObject pyInRef(PyEdsObject_New(inRef));
+    OwnedPyObject pyEvent(
+        GetEnum("edsdk.constants", "ObjectEvent", inEvent));
+    if (!pyEvent) {
+        PyErr_Clear();
+        pyEvent.reset(PyLong_FromUnsignedLong(inEvent));
+    }
+    if (!pyInRef || !pyEvent) {
+        return ReportPythonCallbackError(callbackContext);
+    }
+
+    PyObject *result = callbackContext->context == nullptr
+        ? PyObject_CallFunctionObjArgs(
+            callbackContext->callable,
+            pyEvent.get(),
+            pyInRef.get(),
+            nullptr)
+        : PyObject_CallFunctionObjArgs(
+            callbackContext->callable,
+            pyEvent.get(),
+            pyInRef.get(),
+            callbackContext->context,
+            nullptr);
+    return PythonCallbackResult(result, callbackContext);
+}
+
+
+static EdsError EDSCALLBACK StateEventCallbackWrapper(
+        EdsStateEvent inEvent,
+        EdsUInt32 inEventData,
+        EdsVoid *inContext)
+{
+    PythonGILGuard gil;
+    PythonCallbackContext *callbackContext =
+        static_cast<PythonCallbackContext *>(inContext);
+    OwnedPyObject pyEvent(
+        GetEnum("edsdk.constants", "StateEvent", inEvent));
+    if (!pyEvent) {
+        PyErr_Clear();
+        pyEvent.reset(PyLong_FromUnsignedLong(inEvent));
+    }
+    OwnedPyObject pyEventData(PyLong_FromUnsignedLong(inEventData));
+    if (!pyEvent || !pyEventData) {
+        return ReportPythonCallbackError(callbackContext);
+    }
+
+    PyObject *result = callbackContext->context == nullptr
+        ? PyObject_CallFunctionObjArgs(
+            callbackContext->callable,
+            pyEvent.get(),
+            pyEventData.get(),
+            nullptr)
+        : PyObject_CallFunctionObjArgs(
+            callbackContext->callable,
+            pyEvent.get(),
+            pyEventData.get(),
+            callbackContext->context,
+            nullptr);
+    return PythonCallbackResult(result, callbackContext);
+}
+
+
 PyDoc_STRVAR(PyEds_InitializeSDK__doc__,
 "Initializes the libraries.\n"
 "When using the EDSDK libraries, you must call this API once\n"
@@ -365,7 +633,7 @@ PyDoc_STRVAR(PyEds_TerminateSDK__doc__,
 static PyObject* PyEds_TerminateSDK(PyObject *Py_UNUSED(self)) {
     unsigned long retVal(EdsTerminateSDK());
     if (retVal == EDS_ERR_OK) {
-        ClearPythonCallbackReferences();
+        ClearPythonCallbackContexts();
     }
     PyCheck_EDSERROR(retVal);
     Py_RETURN_NONE;
@@ -2025,57 +2293,20 @@ static PyObject* PyEds_SetProgressCallback(PyObject *Py_UNUSED(self), PyObject *
         return nullptr;
     }
 
-    Py_XDECREF(pyProgressCallback[0]);
-    Py_XDECREF(pyProgressCallback[1]);
-
-    pyProgressCallback[0] = pyCallable;
-    pyProgressCallback[1] = pyContext;
-
-    Py_INCREF(pyCallable);
-    Py_XINCREF(pyContext);
-
-    auto callbackWrapper = [](EdsUInt32 inPercent, EdsVoid *inContext, EdsBool *outCancel) -> EdsError {
-        PyGILState_STATE gstate;
-        gstate = PyGILState_Ensure();
-
-        PyObject** pyContext(static_cast<PyObject **>(inContext));
-        PyObject* pyPercent(PyLong_FromUnsignedLong(inPercent));
-        PyObject* pyCancel(PyBool_FromLong(*outCancel));
-        PyObject* pyRetVal(nullptr);
-        if (pyContext[1] == nullptr) {
-            pyRetVal = PyObject_CallFunctionObjArgs(pyContext[0], pyPercent, pyCancel, nullptr);
-        }
-        else {
-            pyRetVal = PyObject_CallFunctionObjArgs(pyContext[0], pyPercent, pyCancel, pyContext[1], nullptr);
-        }
-        if (pyRetVal == nullptr) {
-            PyErr_Format(PyExc_ValueError, "unable to call the callback");
-            Py_DECREF(pyPercent);
-            Py_DECREF(pyCancel);
-            return EDS_ERR_INVALID_FN_POINTER;
-        }
-
-        unsigned long retVal(EDS_ERR_OK);
-        if (PyLong_Check(pyRetVal)) {
-            retVal = PyLong_AsUnsignedLong(pyRetVal);
-        }
-        Py_DECREF(pyRetVal);
-        Py_DECREF(pyPercent);
-        Py_DECREF(pyCancel);
-
-        PyGILState_Release(gstate);
-        return retVal;
-    };
+    PythonCallbackContext *callbackContext =
+        CreatePythonCallbackContext(pyCallable, pyContext);
+    if (callbackContext == nullptr) {
+        return nullptr;
+    }
 
     unsigned long retVal(EdsSetProgressCallback(
         edsObj->edsObj,
-        callbackWrapper,
+        ProgressCallbackWrapper,
         static_cast<EdsProgressOption>(progressOption),
-        pyProgressCallback));
+        callbackContext));
 
     if (retVal != EDS_ERR_OK) {
-        Py_CLEAR(pyProgressCallback[0]);
-        Py_CLEAR(pyProgressCallback[1]);
+        RemovePythonCallbackContext(callbackContext);
         PyCheck_EDSERROR(retVal);
     }
     Py_RETURN_NONE;
@@ -2287,57 +2518,27 @@ static PyObject* PyEds_SetCameraAddedHandler(PyObject *Py_UNUSED(self), PyObject
         return nullptr;
     }
 
-    if (!PyCallable_CheckNumberOfParameters(pyCallable, 0) ||
+    if (!PyCallable_CheckNumberOfParameters(pyCallable, 0) &&
             !PyCallable_CheckNumberOfParameters(pyCallable, 1)) {
         PyErr_Format(PyExc_ValueError,
-                     "expected a callable object with 0 or 1 parameters"
+                     "expected a callable object with 0 or 1 parameters "
                      "(context: Any = None) -> int");
         return nullptr;
     }
 
-    Py_XDECREF(pyCameraAddedCallback[0]);
-    Py_XDECREF(pyCameraAddedCallback[1]);
-
-    pyCameraAddedCallback[0] = pyCallable;
-    pyCameraAddedCallback[1] = pyContext;
-
-    Py_INCREF(pyCallable);
-    Py_XINCREF(pyContext);
-
-    auto callbackWrapper = [](EdsVoid* inContext) -> EdsError {
-        PyGILState_STATE gstate;
-        gstate = PyGILState_Ensure();
-
-        PyObject** pyContext = static_cast<PyObject **>(inContext);
-        PyObject* pyRetVal{nullptr};
-        if (pyContext[1] == nullptr) {
-            pyRetVal = PyObject_CallFunctionObjArgs(pyContext[0], nullptr);
-        }
-        else {
-            pyRetVal = PyObject_CallFunctionObjArgs(pyContext[0], pyContext[1], nullptr);
-        }
-        if (pyRetVal == nullptr) {
-            PyErr_Format(PyExc_ValueError, "unable to call the callback");
-            return EDS_ERR_INVALID_FN_POINTER;
-        }
-        unsigned long retVal(EDS_ERR_OK);
-        if (PyLong_Check(pyRetVal)) {
-            retVal = PyLong_AsUnsignedLong(pyRetVal);
-        }
-        Py_DECREF(pyRetVal);
-
-        PyGILState_Release(gstate);
-        return retVal;
-    };
+    PythonCallbackContext *callbackContext =
+        CreatePythonCallbackContext(pyCallable, pyContext);
+    if (callbackContext == nullptr) {
+        return nullptr;
+    }
 
     unsigned long retVal(
         EdsSetCameraAddedHandler(
-            callbackWrapper,
-            pyCameraAddedCallback));
+            CameraAddedCallbackWrapper,
+            callbackContext));
 
     if (retVal != EDS_ERR_OK) {
-        Py_CLEAR(pyCameraAddedCallback[0]);
-        Py_CLEAR(pyCameraAddedCallback[1]);
+        RemovePythonCallbackContext(callbackContext);
         PyCheck_EDSERROR(retVal);
     }
     Py_RETURN_NONE;
@@ -2352,7 +2553,7 @@ PyDoc_STRVAR(PyEds_SetPropertyEventHandler__doc__,
 "\tTo designate all events, use PropertyEvent.All.\n"
 ":param Callable callback: the callback for receiving events.\n"
 "\tExpected signature\n"
-"\t\t(event: StateEvent, prop_id: PropID, param: int, context: Any = None) -> int.\n"
+"\t\t(event: PropertyEvent, prop_id: PropID, param: int, context: Any = None) -> int.\n"
 ":raises EdsError: Any of the sdk errors.");
 
 static PyObject* PyEds_SetPropertyEventHandler(PyObject *Py_UNUSED(self), PyObject *args) {
@@ -2383,69 +2584,20 @@ static PyObject* PyEds_SetPropertyEventHandler(PyObject *Py_UNUSED(self), PyObje
         return nullptr;
     }
 
-    Py_XDECREF(pySetPropertyCallback[0]);
-    Py_XDECREF(pySetPropertyCallback[1]);
-
-    pySetPropertyCallback[0] = pyCallable;
-    pySetPropertyCallback[1] = pyContext;
-
-    Py_INCREF(pyCallable);
-    Py_XINCREF(pyContext);
-
-    auto callbackWrapper = [](EdsPropertyEvent inEvent, EdsPropertyID inPropertyID, EdsUInt32 inParam, EdsVoid* inContext) -> EdsError {
-
-        PyGILState_STATE gstate;
-        gstate = PyGILState_Ensure();
-
-        PyObject **pyContext = static_cast<PyObject **>(inContext);
-        PyObject *pyEvent = GetEnum("edsdk.constants", "PropertyEvent", inEvent);
-        if (pyEvent == nullptr) {
-            PyErr_Clear();
-            std::cout << "Unknown Property Event: " << inEvent  << std::endl;
-            pyEvent = PyLong_FromUnsignedLong(inEvent);
-        }
-        PyObject *pyPropertyID = GetEnum("edsdk.constants", "PropID", inPropertyID);
-        if (pyPropertyID == nullptr) {
-            PyErr_Clear();
-            std::cout << "Unknown Property ID: " << inPropertyID  << std::endl;
-            pyPropertyID = PyLong_FromUnsignedLong(inPropertyID);
-        }
-        PyObject *pyParam = PyLong_FromUnsignedLong(inParam);
-
-        PyObject *pyRetVal{nullptr};
-        if (pyContext[1] == nullptr){
-            pyRetVal = PyObject_CallFunctionObjArgs(pyContext[0], pyEvent, pyPropertyID, pyParam, nullptr);
-        }
-        else {
-            pyRetVal = PyObject_CallFunctionObjArgs(pyContext[0], pyEvent, pyPropertyID, pyParam, pyContext[1], nullptr);
-        }
-        if (pyRetVal == nullptr) {
-            PyErr_Format(PyExc_ValueError, "unable to call the callback");
-            Py_DECREF(pyEvent);
-            Py_DECREF(pyPropertyID);
-            Py_DECREF(pyParam);
-            return EDS_ERR_INVALID_FN_POINTER;
-        }
-
-        unsigned long retVal(EDS_ERR_OK);
-        if (PyLong_Check(pyRetVal)) {
-            retVal = PyLong_AsUnsignedLong(pyRetVal);
-        }
-        Py_DECREF(pyRetVal);
-        Py_DECREF(pyEvent);
-        Py_DECREF(pyParam);
-        Py_DECREF(pyPropertyID);
-
-        PyGILState_Release(gstate);
-        return retVal;
-    };
+    PythonCallbackContext *callbackContext =
+        CreatePythonCallbackContext(pyCallable, pyContext);
+    if (callbackContext == nullptr) {
+        return nullptr;
+    }
 
     unsigned long retVal(EdsSetPropertyEventHandler(
-        edsObj->edsObj, event, callbackWrapper, pySetPropertyCallback));
+        edsObj->edsObj,
+        event,
+        PropertyEventCallbackWrapper,
+        callbackContext));
 
     if (retVal != EDS_ERR_OK) {
-        Py_CLEAR(pySetPropertyCallback[0]);
-        Py_CLEAR(pySetPropertyCallback[1]);
+        RemovePythonCallbackContext(callbackContext);
         PyCheck_EDSERROR(retVal);
     }
     Py_RETURN_NONE;
@@ -2492,60 +2644,20 @@ static PyObject* PyEds_SetObjectEventHandler(PyObject *Py_UNUSED(self), PyObject
         return nullptr;
     }
 
-    Py_XDECREF(pySetObjectCallback[0]);
-    Py_XDECREF(pySetObjectCallback[1]);
-
-    pySetObjectCallback[0] = pyCallable;
-    pySetObjectCallback[1] = pyContext;
-
-    Py_INCREF(pyCallable);
-    Py_XINCREF(pyContext);
-
-    auto callbackWrapper = [](EdsStateEvent inEvent, EdsBaseRef inRef, EdsVoid* inContext) -> EdsError {
-
-        PyGILState_STATE gstate;
-        gstate = PyGILState_Ensure();
-
-        PyObject **pyContext = static_cast<PyObject **>(inContext);
-        PyObject *pyEvent = GetEnum("edsdk.constants", "ObjectEvent", inEvent);
-        if (pyEvent == nullptr) {
-            PyErr_Clear();
-            std::cout << "Unknown Object Event: " << inEvent  << std::endl;
-            pyEvent = PyLong_FromUnsignedLong(inEvent);
-        }
-        PyObject* pyInRef = PyEdsObject_New(inRef);
-
-        PyObject* pyRetVal(nullptr);
-        if (pyContext[1] == nullptr){
-            pyRetVal = PyObject_CallFunctionObjArgs(pyContext[0], pyEvent, pyInRef, nullptr);
-        }
-        else {
-            pyRetVal = PyObject_CallFunctionObjArgs(pyContext[0], pyEvent, pyInRef, pyContext[1], nullptr);
-        }
-        if (pyRetVal == nullptr) {
-            PyErr_Format(PyExc_ValueError, "unable to call the callback");
-            Py_DECREF(pyEvent);
-            Py_DECREF(pyInRef);
-            return EDS_ERR_INVALID_FN_POINTER;
-        }
-        unsigned long retVal(EDS_ERR_OK);
-        if (PyLong_Check(pyRetVal)) {
-            retVal = PyLong_AsUnsignedLong(pyRetVal);
-        }
-        Py_DECREF(pyEvent);
-        Py_DECREF(pyInRef);
-        Py_DECREF(pyRetVal);
-
-        PyGILState_Release(gstate);
-        return retVal;
-    };
+    PythonCallbackContext *callbackContext =
+        CreatePythonCallbackContext(pyCallable, pyContext);
+    if (callbackContext == nullptr) {
+        return nullptr;
+    }
 
     unsigned long retVal(EdsSetObjectEventHandler(
-        edsObj->edsObj, event, callbackWrapper, pySetObjectCallback));
+        edsObj->edsObj,
+        event,
+        ObjectEventCallbackWrapper,
+        callbackContext));
 
     if (retVal != EDS_ERR_OK) {
-        Py_CLEAR(pySetObjectCallback[0]);
-        Py_CLEAR(pySetObjectCallback[1]);
+        RemovePythonCallbackContext(callbackContext);
         PyCheck_EDSERROR(retVal);
     }
     Py_RETURN_NONE;
@@ -2590,62 +2702,20 @@ static PyObject *PyEds_SetCameraStateEventHandler(PyObject *Py_UNUSED(self), PyO
         return nullptr;
     }
 
-    Py_XDECREF(pySetCameraStateCallback[0]);
-    Py_XDECREF(pySetCameraStateCallback[1]);
-
-    pySetCameraStateCallback[0] = pyCallable;
-    pySetCameraStateCallback[1] = pyContext;
-
-    Py_INCREF(pyCallable);
-    Py_XINCREF(pyContext);
-
-    auto callbackWrapper = [](EdsStateEvent inEvent, EdsUInt32 inEventData, EdsVoid* inContext) -> EdsError {
-        PyGILState_STATE gstate;
-        gstate = PyGILState_Ensure();
-
-        PyObject *pyEvent = GetEnum("edsdk.constants", "StateEvent", inEvent);
-        if (pyEvent == nullptr) {
-            PyErr_Clear();
-            std::cout << "Unknown State Event: " << inEvent << std::endl;
-            pyEvent = PyLong_FromUnsignedLong(inEvent);
-        }
-        PyObject *pyEventData = PyLong_FromUnsignedLong(inEventData);
-        PyObject **pyContext = static_cast<PyObject **>(inContext);
-        PyObject *pyRetVal(nullptr);
-        if (pyContext[1] == nullptr) {
-            pyRetVal = PyObject_CallFunctionObjArgs(pyContext[0], pyEvent, pyEventData, nullptr);
-        }
-        else {
-            pyRetVal = PyObject_CallFunctionObjArgs(pyContext[0], pyEvent, pyEventData, pyContext[1], nullptr);
-        }
-        if (pyRetVal == nullptr) {
-            PyErr_Format(PyExc_ValueError, "unable to call the callback");
-            Py_DECREF(pyEvent);
-            Py_DECREF(pyEventData);
-            return EDS_ERR_INVALID_FN_POINTER;
-        }
-
-        unsigned long retVal(EDS_ERR_OK);
-        if (PyLong_Check(pyRetVal)) {
-            retVal = PyLong_AsUnsignedLong(pyRetVal);
-        }
-        Py_DECREF(pyEvent);
-        Py_DECREF(pyEventData);
-        Py_DECREF(pyRetVal);
-
-        PyGILState_Release(gstate);
-        return retVal;
-    };
+    PythonCallbackContext *callbackContext =
+        CreatePythonCallbackContext(pyCallable, pyContext);
+    if (callbackContext == nullptr) {
+        return nullptr;
+    }
 
     unsigned long retVal(
         EdsSetCameraStateEventHandler(
             edsObj->edsObj, event,
-            callbackWrapper,
-            pySetCameraStateCallback));
+            StateEventCallbackWrapper,
+            callbackContext));
 
     if (retVal != EDS_ERR_OK) {
-        Py_CLEAR(pySetCameraStateCallback[0]);
-        Py_CLEAR(pySetCameraStateCallback[1]);
+        RemovePythonCallbackContext(callbackContext);
         PyCheck_EDSERROR(retVal);
     }
     Py_RETURN_NONE;

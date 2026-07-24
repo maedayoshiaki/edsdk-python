@@ -392,7 +392,10 @@ def CopyData(
     ...
 
 def SetProgressCallback(
-    camera: EdsObject, callback: Callable, option: ProgressOption
+    stream_or_image: EdsObject,
+    callback: Callable,
+    option: ProgressOption,
+    context: Any = ...,
 ) -> None:
     """Register a progress callback function.
     An event is received as notification of progress during processing that
@@ -404,7 +407,8 @@ def SetProgressCallback(
 
     :param EdsObject stream_or_image: the stream or image object.
     :param Callable callback: The callback function.
-        Expected signature (percent: int, cancel: bool) -> int.
+        Expected signature
+        (percent: int, cancel: bool, context: Any = None) -> int.
     :param ProgressOption option: The option about progress is specified.
         Must be one of the following values.
             ProgressOption.Done
@@ -412,6 +416,7 @@ def SetProgressCallback(
                 is called only once.
             ProgressOption.Periodically
                 A callback function is performed periodically.
+    :param Any context: Optional application context passed to the callback.
     :raises EdsError: Any of the sdk errors.
     """
     ...
@@ -514,17 +519,21 @@ def DownloadEvfImage(camera: EdsObject, evf_image: EdsObject) -> None:
     """
     ...
 
-def SetCameraAddedHandler(callback: Callable) -> None:
+def SetCameraAddedHandler(callback: Callable, context: Any = ...) -> None:
     """Registers a callback function for when a camera is detected.
 
     :param Callable callback: the callback called when a camera is connected.
-        Expected signature () -> int.
+        Expected signature (context: Any = None) -> int.
+    :param Any context: Optional application context passed to the callback.
     :raises EdsError: Any of the sdk errors.
     """
     ...
 
 def SetPropertyEventHandler(
-    camera: EdsObject, event: PropertyEvent, callback: Callable
+    camera: EdsObject,
+    event: PropertyEvent,
+    callback: Callable,
+    context: Any = ...,
 ) -> None:
     """Registers a callback function for receiving status
             change notification events for property states on a camera.
@@ -533,13 +542,19 @@ def SetPropertyEventHandler(
     :param PropertyEvent event: the event to be supplemented.
         To designate all events, use PropertyEvent.All.
     :param Callable callback: the callback for receiving events.
-        Expected signature (event: StateEvent, prop_id: PropID, param: int) -> int.
+        Expected signature
+        (event: PropertyEvent, prop_id: PropID, param: int,
+        context: Any = None) -> int.
+    :param Any context: Optional application context passed to the callback.
     :raises EdsError: Any of the sdk errors.
     """
     ...
 
 def SetObjectEventHandler(
-    camera: EdsObject, event: ObjectEvent, callback: Callable
+    camera: EdsObject,
+    event: ObjectEvent,
+    callback: Callable,
+    context: Any = ...,
 ) -> None:
     """Registers a callback function for receiving status
             change notification events for objects on a remote camera.
@@ -550,13 +565,19 @@ def SetObjectEventHandler(
     :param ObjectEvent event: the event to be supplemented.
         To designate all events, use ObjectEvent.All.
     :param Callable callback: the callback for receiving events.
-        Expected signature (event: ObjectEvent, obj_ref: EdsObject) -> int.
+        Expected signature
+        (event: ObjectEvent, obj_ref: EdsObject,
+        context: Any = None) -> int.
+    :param Any context: Optional application context passed to the callback.
     :raises EdsError: Any of the sdk errors.
     """
     ...
 
 def SetCameraStateEventHandler(
-    camera: EdsObject, event: StateEvent, callback: Callable
+    camera: EdsObject,
+    event: StateEvent,
+    callback: Callable,
+    context: Any = ...,
 ) -> None:
     """Registers a callback function for receiving status
             change notification events for property states on a camera
@@ -565,7 +586,9 @@ def SetCameraStateEventHandler(
     :param StateEvent event: the event to be supplemented.
         To designate all events, use StateEvent.All.
     :param Callable callback: the callback for receiving the events.
-        Expected signature (event: StateEvent, event_data: int) -> int.
+        Expected signature
+        (event: StateEvent, event_data: int, context: Any = None) -> int.
+    :param Any context: Optional application context passed to the callback.
     :raises EdsError: Any of the sdk errors.
     """
     ...
